@@ -1013,6 +1013,31 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 		Value:    metrics.DefaultConfig.InfluxDBOrganization,
 		Category: flags.MetricsCategory,
 	}
+
+	// Bridge settings
+	BridgeAPIBaseFlag = &cli.StringFlag{
+		Name:     "bridge.apibase",
+		Usage:    "Base URL for bridge API",
+		Category: flags.EthCategory,
+	}
+	BridgeTimeoutFlag = &cli.DurationFlag{
+		Name:     "bridge.timeout",
+		Usage:    "Timeout for bridge API requests",
+		Value:    30 * time.Second,
+		Category: flags.EthCategory,
+	}
+	BridgePostBlockFlag = &cli.StringFlag{
+		Name:     "bridge.postblock",
+		Usage:    "Endpoint for posting block data",
+		Value:    "/blocks",
+		Category: flags.EthCategory,
+	}
+	BridgeGetAddressesFlag = &cli.StringFlag{
+		Name:     "bridge.getaddresses",
+		Usage:    "Endpoint for getting contract addresses",
+		Value:    "/addresses",
+		Category: flags.EthCategory,
+	}
 )
 
 var (
@@ -1601,6 +1626,22 @@ func setRequiredBlocks(ctx *cli.Context, cfg *ethconfig.Config) {
 	}
 }
 
+func setBridge(ctx *cli.Context, cfg *ethconfig.Config) {
+	// Bridge configuration
+	if ctx.IsSet(BridgeAPIBaseFlag.Name) {
+		cfg.BridgeAPIBase = ctx.String(BridgeAPIBaseFlag.Name)
+	}
+	if ctx.IsSet(BridgeTimeoutFlag.Name) {
+		cfg.BridgeTimeout = ctx.Duration(BridgeTimeoutFlag.Name)
+	}
+	if ctx.IsSet(BridgePostBlockFlag.Name) {
+		cfg.BridgePostBlockEP = ctx.String(BridgePostBlockFlag.Name)
+	}
+	if ctx.IsSet(BridgeGetAddressesFlag.Name) {
+		cfg.BridgeGetAddressesEP = ctx.String(BridgeGetAddressesFlag.Name)
+	}
+}
+
 // SetEthConfig applies eth-related command line flags to the config.
 func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	// Avoid conflicting network flags, don't allow network id override on preset networks
@@ -1614,6 +1655,8 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	setBlobPool(ctx, &cfg.BlobPool)
 	setMiner(ctx, &cfg.Miner)
 	setRequiredBlocks(ctx, cfg)
+	setLes(ctx, cfg)
+	setBridge(ctx, cfg)
 
 	// Cap the cache allowance and tune the garbage collector
 	mem, err := gopsutil.VirtualMemory()

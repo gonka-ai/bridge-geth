@@ -167,7 +167,8 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 				// Reserve a chunk of fetches for a peer. A nil can mean either that
 				// no more headers are available, or that the peer is known not to
 				// have them.
-				request, _, throttle := queue.reserve(peer, queue.capacity(peer, d.peers.rates.TargetRoundTrip()))
+				capacity := queue.capacity(peer, d.peers.rates.TargetRoundTrip())
+				request, _, throttle := queue.reserve(peer, capacity)
 				if throttle {
 					throttled = true
 					throttleCounter.Inc(1)
