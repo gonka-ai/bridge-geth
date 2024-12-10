@@ -228,6 +228,7 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 	defer api.forkchoiceLock.Unlock()
 
 	log.Trace("Engine API request received", "method", "ForkchoiceUpdated", "head", update.HeadBlockHash, "finalized", update.FinalizedBlockHash, "safe", update.SafeBlockHash)
+
 	if update.HeadBlockHash == (common.Hash{}) {
 		log.Warn("Forkchoice requested update to zero hash")
 		return engine.STATUS_INVALID, nil // TODO(karalabe): Why does someone send us this?
@@ -273,6 +274,13 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 			}
 		}
 		log.Info("Forkchoice requested sync to new head", context...)
+		if api.eth.SyncMode() == ethconfig.ReceiptSync || api.eth.SyncMode() == ethconfig.FullSync {
+			if finalized != nil {
+				log.Info("RACE: Processing forkchoice update in ReceiptSync mode with finalized block",
+					"head", update.HeadBlockHash,
+					"finalized", update.FinalizedBlockHash)
+			}
+		}
 		if err := api.eth.Downloader().BeaconSync(api.eth.SyncMode(), header, finalized); err != nil {
 			return engine.STATUS_SYNCING, err
 		}
@@ -735,6 +743,7 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 	// our live chain. As such, payload execution will not permit reorgs and thus
 	// will not trigger a sync cycle. That is fine though, if we get a fork choice
 	// update after legit payload executions.
+	log.Info("Check new block parent", "number", block.NumberU64(), "hash", block.Hash(), "parentHash", block.ParentHash())
 	parent := api.eth.BlockChain().GetBlock(block.ParentHash(), block.NumberU64()-1)
 	if parent == nil {
 		return api.delayPayloadImport(block), nil
@@ -747,9 +756,30 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 	// tries to make it import a block. That should be denied as pushing something
 	// into the database directly will conflict with the assumptions of snap sync
 	// that it has an empty db that it can fill itself.
-	if api.eth.SyncMode() != ethconfig.FullSync {
+	if api.eth.SyncMode() != ethconfig.FullSync && api.eth.SyncMode() != ethconfig.ReceiptSync {
+		log.Info("NON-RACE: Delay payload because were not in full sync or receipt sync", "number", block.NumberU64(), "mode", api.eth.SyncMode())
 		return api.delayPayloadImport(block), nil
 	}
+
+	// In ReceiptSync mode, we don't need full state - we can consider blocks valid
+	// as long as they have a parent block (even without state)
+	if api.eth.SyncMode() == ethconfig.ReceiptSync {
+		// For ReceiptSync mode, we bypass the HasBlockAndState check
+		// We still need to check if the parent block exists to maintain chain integrity
+		if api.eth.BlockChain().GetBlock(block.ParentHash(), block.NumberU64()-1) == nil {
+			api.remoteBlocks.put(block.Hash(), block.Header())
+			log.Info("RACE: Parent block not available in ReceiptSync mode, accepting for now")
+			return engine.PayloadStatusV1{Status: engine.ACCEPTED}, nil
+		}
+
+		// For ReceiptSync, we're only interested in receipts, so we can mark as valid
+		// without inserting the block (which would fail without state)
+		log.Info("RACE: Considering block valid in ReceiptSync mode", "number", block.NumberU64(), "hash", block.Hash())
+		hash := block.Hash()
+		return engine.PayloadStatusV1{Status: engine.VALID, LatestValidHash: &hash}, nil
+	}
+
+	// For FullSync we need both block and state
 	if !api.eth.BlockChain().HasBlockAndState(block.ParentHash(), block.NumberU64()-1) {
 		api.remoteBlocks.put(block.Hash(), block.Header())
 		log.Warn("State not available, ignoring new payload")
@@ -795,9 +825,18 @@ func (api *ConsensusAPI) delayPayloadImport(block *types.Block) engine.PayloadSt
 	// Although we don't want to trigger a sync, if there is one already in
 	// progress, try to extend it with the current payload request to relieve
 	// some strain from the forkchoice update.
+	// For ReceiptSync, use BeaconSync to force restart sync cycle
+	log.Warn("RACE: delayPayloadImport - BeaconSync", "mode", api.eth.SyncMode())
+	//err := api.eth.Downloader().BeaconSync(api.eth.SyncMode(), block.Header(), nil)
 	err := api.eth.Downloader().BeaconExtend(api.eth.SyncMode(), block.Header())
 	if err == nil {
-		log.Debug("Payload accepted for sync extension", "number", block.NumberU64(), "hash", block.Hash())
+		// Special handling for ReceiptSync mode - always mark blocks as valid
+		// This enables proper finality when we're only concerned with receipts
+		if api.eth.SyncMode() == ethconfig.ReceiptSync || api.eth.SyncMode() == ethconfig.FullSync {
+			log.Info("RACE-BAD: delayPayloadImport -Marking delayed payload as VALID in ReceiptSync mode", "number", block.NumberU64(), "hash", block.Hash())
+			hash := block.Hash()
+			return engine.PayloadStatusV1{Status: engine.VALID, LatestValidHash: &hash}
+		}
 		return engine.PayloadStatusV1{Status: engine.SYNCING}
 	}
 	// Either no beacon sync was started yet, or it rejected the delivered

@@ -72,6 +72,10 @@ var Defaults = Config{
 	RPCTxFeeCap:          1, // 1 ether
 	TxSyncDefaultTimeout: 20 * time.Second,
 	TxSyncMaxTimeout:     1 * time.Minute,
+	BridgeAPIBase:        "",
+	BridgeTimeout:        30 * time.Second,
+	BridgePostBlockEP:    "/blocks",
+	BridgeGetAddressesEP: "/addresses",
 }
 
 //go:generate go run github.com/fjl/gencodec -type Config -formats toml -out gen_config.go
@@ -98,6 +102,12 @@ type Config struct {
 	// State options.
 	NoPruning  bool // Whether to disable pruning and flush everything to disk
 	NoPrefetch bool // Whether to disable prefetching and only load state on demand
+
+	// Bridge settings
+	BridgeAPIBase        string        // Base URL for bridge API
+	BridgeTimeout        time.Duration // Timeout for bridge API requests
+	BridgePostBlockEP    string        // Endpoint for posting block data
+	BridgeGetAddressesEP string        // Endpoint for getting contract addresses
 
 	// Deprecated: use 'TransactionHistory' instead.
 	TxLookupLimit uint64 `toml:",omitempty"` // The maximum number of blocks from head whose tx indices are reserved.
