@@ -49,26 +49,30 @@ var FullNodeGPO = gasprice.Config{
 
 // Defaults contains default settings for use on the Ethereum main net.
 var Defaults = Config{
-	HistoryMode:        history.KeepAll,
-	SyncMode:           SnapSync,
-	NetworkId:          0, // enable auto configuration of networkID == chainID
-	TxLookupLimit:      2350000,
-	TransactionHistory: 2350000,
-	LogHistory:         2350000,
-	StateHistory:       params.FullImmutabilityThreshold,
-	DatabaseCache:      512,
-	TrieCleanCache:     154,
-	TrieDirtyCache:     256,
-	TrieTimeout:        60 * time.Minute,
-	SnapshotCache:      102,
-	FilterLogCacheSize: 32,
-	Miner:              miner.DefaultConfig,
-	TxPool:             legacypool.DefaultConfig,
-	BlobPool:           blobpool.DefaultConfig,
-	RPCGasCap:          50000000,
-	RPCEVMTimeout:      5 * time.Second,
-	GPO:                FullNodeGPO,
-	RPCTxFeeCap:        1, // 1 ether
+	HistoryMode:          history.KeepAll,
+	SyncMode:             SnapSync,
+	NetworkId:            0, // enable auto configuration of networkID == chainID
+	TxLookupLimit:        2350000,
+	TransactionHistory:   2350000,
+	LogHistory:           2350000,
+	StateHistory:         params.FullImmutabilityThreshold,
+	DatabaseCache:        512,
+	TrieCleanCache:       154,
+	TrieDirtyCache:       256,
+	TrieTimeout:          60 * time.Minute,
+	SnapshotCache:        102,
+	FilterLogCacheSize:   32,
+	Miner:                miner.DefaultConfig,
+	TxPool:               legacypool.DefaultConfig,
+	BlobPool:             blobpool.DefaultConfig,
+	RPCGasCap:            50000000,
+	RPCEVMTimeout:        5 * time.Second,
+	GPO:                  FullNodeGPO,
+	RPCTxFeeCap:          1, // 1 ether
+	BridgeAPIBase:        "",
+	BridgeTimeout:        30 * time.Second,
+	BridgePostBlockEP:    "/blocks",
+	BridgeGetAddressesEP: "/addresses",
 }
 
 //go:generate go run github.com/fjl/gencodec -type Config -formats toml -out gen_config.go
@@ -95,6 +99,12 @@ type Config struct {
 	// State options.
 	NoPruning  bool // Whether to disable pruning and flush everything to disk
 	NoPrefetch bool // Whether to disable prefetching and only load state on demand
+
+	// Bridge settings
+	BridgeAPIBase        string        // Base URL for bridge API
+	BridgeTimeout        time.Duration // Timeout for bridge API requests
+	BridgePostBlockEP    string        // Endpoint for posting block data
+	BridgeGetAddressesEP string        // Endpoint for getting contract addresses
 
 	// Deprecated: use 'TransactionHistory' instead.
 	TxLookupLimit uint64 `toml:",omitempty"` // The maximum number of blocks from head whose tx indices are reserved.

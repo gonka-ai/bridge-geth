@@ -39,6 +39,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool/locals"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/eth/bridge"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -110,6 +111,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if !config.SyncMode.IsValid() {
 		return nil, fmt.Errorf("invalid sync mode %d", config.SyncMode)
 	}
+
+	// Ensure configuration values are compatible and sane
 	if !config.HistoryMode.IsValid() {
 		return nil, fmt.Errorf("invalid history mode %d", config.HistoryMode)
 	}
@@ -149,6 +152,12 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Initialize bridge configuration if API base is provided
+	if config.BridgeAPIBase != "" {
+		bridge.SetConfig(config, chainConfig)
+	}
+
 	engine, err := ethconfig.CreateConsensusEngine(chainConfig, chainDb)
 	if err != nil {
 		return nil, err

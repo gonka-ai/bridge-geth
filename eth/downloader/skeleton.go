@@ -221,6 +221,10 @@ type skeleton struct {
 	terminate  chan chan error  // Termination channel to abort sync
 	terminated chan struct{}    // Channel to signal that the syncer is dead
 
+	// Storage for all received headers until we get a finalized header
+	pendingHeaders map[common.Hash]*types.Header // Map of headers by hash
+	lastFinalHead  *types.Header                 // Last finalized header we processed
+
 	// Callback hooks used during testing
 	syncStarting func() // callback triggered after a sync cycle is inited but before started
 }
@@ -229,14 +233,15 @@ type skeleton struct {
 // header chain until it's linked into an existing set of blocks.
 func newSkeleton(db ethdb.Database, peers *peerSet, drop peerDropFn, filler backfiller) *skeleton {
 	sk := &skeleton{
-		db:         db,
-		filler:     filler,
-		peers:      peers,
-		drop:       drop,
-		requests:   make(map[uint64]*headerRequest),
-		headEvents: make(chan *headUpdate),
-		terminate:  make(chan chan error),
-		terminated: make(chan struct{}),
+		db:             db,
+		filler:         filler,
+		peers:          peers,
+		drop:           drop,
+		requests:       make(map[uint64]*headerRequest),
+		pendingHeaders: make(map[common.Hash]*types.Header),
+		headEvents:     make(chan *headUpdate),
+		terminate:      make(chan chan error),
+		terminated:     make(chan struct{}),
 	}
 	go sk.startup()
 	return sk
@@ -294,7 +299,23 @@ func (s *skeleton) startup() {
 					// The subchain being synced got modified at the head in a
 					// way that requires resyncing it. Restart sync with the new
 					// head to force a cleanup.
-					head = newhead
+					if newhead != nil {
+						head = newhead
+						log.Info("Restarting sync with new head after reorg", "number", head.Number, "hash", head.Hash())
+					} else {
+						// If no new head was provided, read from the database
+						head = rawdb.ReadSkeletonHeader(s.db, s.progress.Subchains[0].Head)
+						if head == nil {
+							log.Error("Missing head header after reorg, resetting sync")
+							head = event.header
+						} else {
+							log.Info("Restarting sync with stored head after reorg", "number", head.Number, "hash", head.Hash())
+						}
+					}
+					// Clear any pending requests to ensure a clean restart
+					s.requests = make(map[uint64]*headerRequest)
+					// Also suspend the backfiller to avoid race conditions
+					s.filler.suspend()
 
 				case err == errTerminated:
 					// Sync was requested to be terminated from within, stop and
@@ -402,6 +423,15 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 			case <-done:
 				return
 			case event := <-s.headEvents:
+				if event.force {
+					// If we receive a forced head update during suspend,
+					// we should accept it to avoid getting stuck
+					event.errc <- nil
+					log.Warn("RACE: Accepted forced head update during suspend",
+						"number", event.header.Number,
+						"hash", event.header.Hash())
+					continue
+				}
 				event.errc <- errors.New("beacon syncer reorging")
 			}
 		}
@@ -468,6 +498,19 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 			// we don't seamlessly integrate reorgs to keep things simple. If the
 			// network starts doing many mini reorgs, it might be worthwhile handling
 			// a limited depth without an error.
+			log.Info("SKELETON: Processing new head",
+				"head", func() interface{} {
+					if event.header == nil {
+						return "nil"
+					}
+					return event.header.Number.Uint64()
+				}(),
+				"finalized", func() interface{} {
+					if event.final == nil {
+						return "nil"
+					}
+					return event.final.Number.Uint64()
+				}())
 			if err := s.processNewHead(event.header, event.final); err != nil {
 				// If a reorg is needed, and we're forcing the new head, signal
 				// the syncer to tear down and start over. Otherwise, drop the
@@ -623,53 +666,121 @@ func (s *skeleton) saveSyncStatus(db ethdb.KeyValueWriter) {
 // the syncer will tear itself down and restart with a fresh head. It is simpler
 // to reconstruct the sync state than to mutate it and hope for the best.
 func (s *skeleton) processNewHead(head *types.Header, final *types.Header) error {
+	// Store the header by hash in our pending headers map
+	s.pendingHeaders[head.Hash()] = head
+	log.Info("Stored new header", "number", head.Number, "hash", head.Hash())
+
 	// If a new finalized block was announced, update the sync process independent
-	// of what happens with the sync head below
+	// of what happens with the sync head below, and process pending headers
 	if final != nil {
-		if number := final.Number.Uint64(); s.progress.Finalized == nil || *s.progress.Finalized != number {
+		number := final.Number.Uint64()
+		if s.progress.Finalized == nil || *s.progress.Finalized != number {
 			s.progress.Finalized = new(uint64)
 			*s.progress.Finalized = final.Number.Uint64()
 
-			s.saveSyncStatus(s.db)
-		}
-	}
-	// If the header cannot be inserted without interruption, return an error for
-	// the outer loop to tear down the skeleton sync and restart it
-	number := head.Number.Uint64()
-
-	lastchain := s.progress.Subchains[0]
-	if lastchain.Tail >= number {
-		// If the chain is down to a single beacon header, and it is re-announced
-		// once more, ignore it instead of tearing down sync for a noop.
-		if lastchain.Head == lastchain.Tail {
-			if current := rawdb.ReadSkeletonHeader(s.db, number); current.Hash() == head.Hash() {
-				return nil
+			// Process all pending headers to create canonical chain from the finalized header
+			if err := s.processCanonicalChain(final); err != nil {
+				log.Error("Failed to process canonical chain", "err", err)
+				return err
 			}
 		}
-		// Not a noop / double head announce, abort with a reorg
-		return fmt.Errorf("%w, tail: %d, head: %d, newHead: %d", errChainReorged, lastchain.Tail, lastchain.Head, number)
+		s.lastFinalHead = final
+	} else if head != nil {
+		// If we only got a new head without finalization, just store it for later processing
+		log.Debug("Stored header without finalization", "number", head.Number, "hash", head.Hash())
 	}
-	if lastchain.Head+1 < number {
-		return fmt.Errorf("%w, head: %d, newHead: %d", errChainGapped, lastchain.Head, number)
-	}
-	if parent := rawdb.ReadSkeletonHeader(s.db, number-1); parent.Hash() != head.ParentHash {
-		return fmt.Errorf("%w, ancestor: %d, hash: %s, want: %s", errChainForked, number-1, parent.Hash(), head.ParentHash)
-	}
-	// New header seems to be in the last subchain range. Unwind any extra headers
-	// from the chain tip and insert the new head. We won't delete any trimmed
-	// skeleton headers since those will be outside the index space of the many
-	// subchains and the database space will be reclaimed eventually when processing
-	// blocks above the current head (TODO(karalabe): don't forget).
-	batch := s.db.NewBatch()
 
-	rawdb.WriteSkeletonHeader(batch, head)
-	lastchain.Head = number
+	return nil
+}
+
+// processCanonicalChain constructs the canonical chain starting from the finalized header
+// and adds all headers to the skeleton in order
+func (s *skeleton) processCanonicalChain(final *types.Header) error {
+	// Start with the finalized header
+	lastchain := s.progress.Subchains[0]
+	current := final
+	chain := []*types.Header{current}
+
+	// Build the chain backwards until we reach our last known finalized header or run out of headers
+	for {
+		parent, exists := s.pendingHeaders[current.ParentHash]
+		if !exists {
+			break
+		}
+		if number := parent.Number.Uint64(); number <= lastchain.Head {
+			break
+		}
+		chain = append(chain, parent)
+		current = parent
+	}
+
+	if len(chain) == 0 {
+		return fmt.Errorf("RACE: no headers in canonical chain")
+	}
+
+	// Reverse the chain to process it from oldest to newest
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+
+	// Process each header in the chain
+	batch := s.db.NewBatch()
+	firstNewHeader := chain[0]
+	firstNewNumber := chain[0].Number.Uint64()
+
+	// Check for discontinuity
+	if lastchain.Head+1 < firstNewNumber {
+		log.Warn("Gap detected in canonical chain", "head", lastchain.Head, "next", firstNewNumber)
+		// Don't return error, just skip this header
+		return fmt.Errorf("RACE: gap detected in canonical chain")
+	}
+
+	// For non-genesis blocks, verify parent linkage
+	if parent := rawdb.ReadSkeletonHeader(s.db, firstNewNumber-1); parent == nil || parent.Hash() != firstNewHeader.ParentHash {
+		log.Warn("Non-sequential header in canonical chain", "number", firstNewNumber, "hash", firstNewHeader.Hash())
+		// Don't return error, just skip this header
+		return fmt.Errorf("RACE: non-sequential header in canonical chain")
+	}
+
+	for _, header := range chain {
+		number := header.Number.Uint64()
+
+		// Write the header to the database
+		rawdb.WriteSkeletonHeader(batch, header)
+		lastchain.Head = number
+
+		log.Debug("Adding header to canonical chain", "number", number, "hash", header.Hash())
+	}
+
+	// Save the updated sync status
 	s.saveSyncStatus(batch)
 
 	if err := batch.Write(); err != nil {
-		log.Crit("Failed to write skeleton sync status", "err", err)
+		log.Crit("Failed to write skeleton headers for canonical chain", "err", err)
+		return err
 	}
+
+	s.cleanupProcessedHeaders(final.Number.Uint64())
+
 	return nil
+}
+
+// cleanupProcessedHeaders removes headers from the pending map that are older than the finalized header
+func (s *skeleton) cleanupProcessedHeaders(finalizedNumber uint64) {
+	// Find all headers that are now below our finalized number
+	var toDelete []common.Hash
+	for hash, header := range s.pendingHeaders {
+		if header.Number.Uint64() <= finalizedNumber {
+			toDelete = append(toDelete, hash)
+		}
+	}
+
+	// Delete them from the map
+	for _, hash := range toDelete {
+		delete(s.pendingHeaders, hash)
+	}
+
+	log.Debug("Cleaned up processed headers", "removed", len(toDelete), "remaining", len(s.pendingHeaders))
 }
 
 // assignTasks attempts to match idle peers to pending header retrievals.
@@ -1244,6 +1355,25 @@ func (s *skeleton) Bounds() (head *types.Header, tail *types.Header, final *type
 			return nil, nil, nil, fmt.Errorf("finalized skeleton header %d is missing", *progress.Finalized)
 		}
 	}
+	log.Info("Skeleton sync bounds",
+		"head", func() interface{} {
+			if head == nil {
+				return "nil"
+			}
+			return head.Number.Uint64()
+		}(),
+		"tail", func() interface{} {
+			if tail == nil {
+				return "nil"
+			}
+			return tail.Number.Uint64()
+		}(),
+		"finalized", func() interface{} {
+			if final == nil {
+				return "nil"
+			}
+			return final.Number.Uint64()
+		}())
 	return head, tail, final, nil
 }
 
