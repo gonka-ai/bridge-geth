@@ -41,6 +41,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool/locals"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/eth/bridge"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/fetcher"
@@ -187,6 +188,12 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Initialize bridge configuration if API base is provided
+	if config.BridgeAPIBase != "" {
+		bridge.SetConfig(config, chainConfig)
+	}
+
 	engine, err := ethconfig.CreateConsensusEngine(chainConfig, chainDb)
 	if err != nil {
 		return nil, err
@@ -451,10 +458,20 @@ func (s *Ethereum) Engine() consensus.Engine           { return s.engine }
 func (s *Ethereum) ChainDb() ethdb.Database            { return s.chainDb }
 func (s *Ethereum) IsListening() bool                  { return true } // Always listening
 func (s *Ethereum) Downloader() *downloader.Downloader { return s.handler.downloader }
-func (s *Ethereum) Synced() bool                       { return s.handler.synced.Load() }
-func (s *Ethereum) SetSynced()                         { s.handler.enableSyncedFeatures() }
-func (s *Ethereum) ArchiveMode() bool                  { return s.config.NoPruning }
-func (s *Ethereum) EngineMaxReorgDepth() uint64        { return s.config.EngineMaxReorgDepth }
+
+// SyncMode reports the sync mode catalyst and bridge code should follow.
+// ReceiptSync is explicit configuration. Otherwise the downloader moderator
+// decides between snap and full, which replaced the old handler.snapSync flag.
+func (s *Ethereum) SyncMode() ethconfig.SyncMode {
+	if s.config.SyncMode == ethconfig.ReceiptSync {
+		return ethconfig.ReceiptSync
+	}
+	return s.Downloader().ConfigSyncMode()
+}
+func (s *Ethereum) Synced() bool                { return s.handler.synced.Load() }
+func (s *Ethereum) SetSynced()                  { s.handler.enableSyncedFeatures() }
+func (s *Ethereum) ArchiveMode() bool           { return s.config.NoPruning }
+func (s *Ethereum) EngineMaxReorgDepth() uint64 { return s.config.EngineMaxReorgDepth }
 
 // Protocols returns all the currently configured network protocols to start.
 func (s *Ethereum) Protocols() []p2p.Protocol {

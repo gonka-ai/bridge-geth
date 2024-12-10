@@ -112,21 +112,54 @@ func (f *fetchResult) BAL() *bal.BlockAccessList {
 	return f.accessList.Load()
 }
 
-func newFetchResult(header *types.Header, snapSync bool, fetchBAL bool) *fetchResult {
+func newFetchResult(header *types.Header, mode SyncMode, fetchBAL bool) *fetchResult {
 	item := &fetchResult{
 		Header: header,
 	}
-	if !header.EmptyBody() {
-		item.pending.Store(item.pending.Load() | (1 << bodyType))
-	} else if header.WithdrawalsHash != nil {
-		item.Withdrawals = make(types.Withdrawals, 0)
-	}
-	if snapSync {
-		if header.EmptyReceipts() {
-			// Ensure the receipts list is valid even if it isn't actively fetched.
-			item.Receipts = rlp.EmptyList
+	switch mode {
+	case ethconfig.ReceiptSync:
+		// Bodies are needed for transaction signatures in ReceiptSync mode
+		if !header.EmptyBody() {
+			item.pending.Store(item.pending.Load() | (1 << bodyType))
+			log.Info("ReceiptSync: Marking body as needed for transaction signatures",
+				"number", header.Number.Uint64(),
+				"hash", header.Hash().Hex(),
+				"pending", item.pending.Load())
+		} else if header.WithdrawalsHash != nil {
+			item.Withdrawals = make(types.Withdrawals, 0)
+			log.Info("ReceiptSync: Block has empty body but has withdrawals",
+				"number", header.Number.Uint64())
 		} else {
+			log.Info("ReceiptSync: Block has empty body",
+				"number", header.Number.Uint64())
+		}
+		if !header.EmptyReceipts() {
 			item.pending.Store(item.pending.Load() | (1 << receiptType))
+			log.Info("ReceiptSync: Marking receipts as needed",
+				"number", header.Number.Uint64(),
+				"pending", item.pending.Load())
+		} else {
+			log.Info("ReceiptSync: Block has empty receipts",
+				"number", header.Number.Uint64())
+			if item.AllDone() {
+				log.Info("Fetch result marked as done as it has no receipts", "header", item.Header.Number.Uint64(), "AllDone", item.AllDone())
+			} else {
+				log.Info("Fetch result has no receipts but somehow is not done", "header", item.Header.Number.Uint64(), "AllDone", item.AllDone())
+			}
+		}
+	default:
+		if !header.EmptyBody() {
+			item.pending.Store(item.pending.Load() | (1 << bodyType))
+		} else if header.WithdrawalsHash != nil {
+			item.Withdrawals = make(types.Withdrawals, 0)
+		}
+		if mode == ethconfig.SnapSync {
+			if header.EmptyReceipts() {
+				// Ensure the receipts list is valid even if it isn't actively fetched.
+				item.Receipts = rlp.EmptyList
+			} else {
+				item.pending.Store(item.pending.Load() | (1 << receiptType))
+			}
 		}
 	}
 	if fetchBAL {
@@ -162,6 +195,7 @@ func (f *fetchResult) AllDone() bool {
 func (f *fetchResult) SetReceiptsDone() {
 	if v := f.pending.Load(); (v & (1 << receiptType)) != 0 {
 		f.pending.Add(-2)
+		log.Info("Receipts marked as done", "header", f.Header.Number.Uint64(), "AllDone", f.AllDone())
 	}
 }
 
@@ -394,29 +428,50 @@ func (q *queue) Schedule(headers []*types.Header, hashes []common.Hash, from uin
 		// Make sure chain order is honoured and preserved throughout
 		hash := hashes[i]
 		if header.Number == nil || header.Number.Uint64() != from {
-			log.Warn("Header broke chain ordering", "number", header.Number, "hash", hash, "expected", from)
+			log.Warn("Schedule: Header broke chain ordering", "number", header.Number, "hash", hash, "expected", from)
 			break
 		}
 		if q.headerHead != (common.Hash{}) && q.headerHead != header.ParentHash {
-			log.Warn("Header broke chain ancestry", "number", header.Number, "hash", hash)
+			log.Warn("Schedule: Header broke chain ancestry", "number", header.Number, "hash", hash, "parentHash", header.ParentHash, "headerHead", q.headerHead)
 			break
 		}
 		// Make sure no duplicate requests are executed
 		// We cannot skip this, even if the block is empty, since this is
 		// what triggers the fetchResult creation.
-		if _, ok := q.blockTaskPool[hash]; ok {
-			log.Warn("Header already scheduled for block fetch", "number", header.Number, "hash", hash)
+		if q.mode != ethconfig.ReceiptSync {
+			if _, ok := q.blockTaskPool[hash]; ok {
+				log.Warn("Header already scheduled for block fetch", "number", header.Number, "hash", hash)
+			} else {
+				q.blockTaskPool[hash] = header
+				q.blockTaskQueue.Push(header, -int64(header.Number.Uint64()))
+			}
 		} else {
-			q.blockTaskPool[hash] = header
-			q.blockTaskQueue.Push(header, -int64(header.Number.Uint64()))
+			// In ReceiptSync mode, we still need to schedule bodies for blocks with transactions
+			if !header.EmptyBody() {
+				if _, ok := q.blockTaskPool[hash]; ok {
+					log.Warn("Header already scheduled for block fetch", "number", header.Number, "hash", hash)
+				} else {
+					q.blockTaskPool[hash] = header
+					q.blockTaskQueue.Push(header, -int64(header.Number.Uint64()))
+					log.Info("ReceiptSync: Scheduling body fetch for transaction signatures",
+						"number", header.Number.Uint64(),
+						"hash", hash.Hex())
+				}
+			}
 		}
 		// Queue for receipt retrieval
-		if q.mode == ethconfig.SnapSync && !header.EmptyReceipts() {
-			if _, ok := q.receiptTaskPool[hash]; ok {
-				log.Warn("Header already scheduled for receipt fetch", "number", header.Number, "hash", hash)
+		if q.mode == ethconfig.ReceiptSync || q.mode == ethconfig.SnapSync {
+			if !header.EmptyReceipts() {
+				if _, ok := q.receiptTaskPool[hash]; ok {
+					log.Warn("Header already scheduled for receipt fetch", "number", header.Number, "hash", hash)
+				} else {
+					q.receiptTaskPool[hash] = header
+					q.receiptTaskQueue.Push(header, -int64(header.Number.Uint64()))
+					log.Info("Scheduling receipt fetch", "number", header.Number, "hash", hash)
+				}
 			} else {
-				q.receiptTaskPool[hash] = header
-				q.receiptTaskQueue.Push(header, -int64(header.Number.Uint64()))
+				q.resultCache.AddFetch(header, q.mode, q.balEligible(header))
+				log.Info("Header has no receipts", "number", header.Number, "hash", hash)
 			}
 		}
 		// Queue for best-effort access list retrieval if the block is recent
@@ -441,6 +496,7 @@ func (q *queue) Schedule(headers []*types.Header, hashes []common.Hash, from uin
 // Results can be called concurrently with Deliver and Schedule,
 // but assumes that there are not two simultaneous callers to Results
 func (q *queue) Results(block bool) []*fetchResult {
+	log.Info("Results called", "block", block)
 	// Abort early if there are no items and non-blocking requested
 	if !block && !q.resultCache.HasCompletedItems() {
 		return nil
@@ -451,6 +507,11 @@ func (q *queue) Results(block bool) []*fetchResult {
 	defer importWaitTimer.UpdateSince(time.Now())
 
 	closed := false
+
+	// Create a ticker that fires every 20 seconds
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+
 	for !closed && !q.resultCache.HasCompletedItems() {
 		// In order to wait on 'active', we need to obtain the lock.
 		// That may take a while, if someone is delivering at the same
@@ -468,7 +529,15 @@ func (q *queue) Results(block bool) []*fetchResult {
 		q.active.Wait()
 		closed = q.closed
 		q.lock.Unlock()
+
+		select {
+		case <-ticker.C:
+			log.Warn("Still waiting for completed items in the result cache", "HasCompletedItems", q.resultCache.HasCompletedItems())
+		default:
+			// Do nothing if the ticker hasn't fired
+		}
 	}
+
 	// Regardless if closed or not, we can still deliver whatever we have
 	results := q.resultCache.GetCompleted(maxResultsProcess)
 
@@ -515,6 +584,11 @@ func (q *queue) Results(block bool) []*fetchResult {
 		info := q.Stats()
 		info = append(info, "throttle", throttleThreshold)
 		log.Debug("Downloader queue stats", info...)
+	}
+	if len(results) > 0 {
+		log.Info("Results is not empty", "closed", closed, "results", len(results))
+	} else {
+		log.Info("Results is empty", "closed", closed)
 	}
 	return results
 }
@@ -686,9 +760,11 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 	// Short circuit if the pool has been depleted, or if the peer's already
 	// downloading something (sanity check not to corrupt state)
 	if taskQueue.Empty() {
+		log.Warn("No headers in the task queue to reserve", "peer", p.id)
 		return nil, false, true
 	}
 	if _, ok := pendPool[p.id]; ok {
+		log.Warn("Already downloading headers", "peer", p.id)
 		return nil, false, false
 	}
 	// Retrieve a batch of tasks, skipping previously failed ones
@@ -719,7 +795,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 		}
 		// we can ask the resultcache if this header is within the
 		// "prioritized" segment of blocks. If it is not, we need to throttle
-		stale, throttle, item := q.resultCache.AddFetch(header, q.mode == ethconfig.SnapSync, q.balEligible(header))
+		stale, throttle, item := q.resultCache.AddFetch(header, q.mode, q.balEligible(header))
 		if stale {
 			// Don't put back in the task queue, this item has already been
 			// delivered upstream. A task outliving the delivery of its block
@@ -747,6 +823,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 			delete(taskPool, header.Hash())
 			taskQueue.PopItem()
 			progress = true
+			log.Info("Skipping noop fetch", "number", header.Number, "hash", header.Hash())
 			continue
 		}
 		if header.Number.Uint64() > latest {
@@ -772,6 +849,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 	}
 	// Assemble and return the block download request
 	if len(send) == 0 {
+		log.Warn("No headers to send", "peer", p.id)
 		return nil, progress, throttled
 	}
 	request := &fetchRequest{
@@ -780,6 +858,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 		Time:    time.Now(),
 	}
 	pendPool[p.id] = request
+	log.Info("Reserved headers", "peer", p.id, "count", len(send))
 	return request, progress, throttled
 }
 
@@ -941,6 +1020,11 @@ func (q *queue) DeliverBodies(id string, hashes eth.BlockBodyHashes, bodies []et
 		result.Uncles = uncleLists[index]
 		result.Withdrawals = withdrawalLists[index]
 		result.SetBodyDone()
+		log.Info("DeliverBodies: Populating transactions in fetchResult",
+			"index", index,
+			"transactionCount", len(txLists[index]),
+			"headerNumber", result.Header.Number.Uint64(),
+			"headerHash", result.Header.Hash().Hex())
 	}
 	nresults := len(hashes.TransactionRoots)
 	return q.deliver(id, q.blockTaskPool, q.blockTaskQueue, q.blockPendPool,
@@ -976,6 +1060,7 @@ func (q *queue) DeliverReceipts(id string, receiptList []rlp.RawValue, receiptLi
 		result.Receipts = receiptList[index]
 		result.SetReceiptsDone()
 	}
+	log.Info("Delivering receipts", "count", len(receiptList))
 	return q.deliver(id, q.receiptTaskPool, q.receiptTaskQueue, q.receiptPendPool,
 		receiptReqTimer, receiptInMeter, receiptDropMeter, len(receiptList), validate, reconstruct)
 }
@@ -1160,6 +1245,7 @@ func (q *queue) Prepare(offset uint64, mode SyncMode) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
+	log.Info("Resetting download queue through Prepare", "offset", offset, "mode", mode)
 	// Prepare the queue for sync results
 	q.resultCache.Prepare(offset)
 	q.mode = mode

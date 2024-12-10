@@ -171,6 +171,9 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 		chainHead = d.blockchain.CurrentBlock()
 	case ethconfig.SnapSync:
 		chainHead = d.blockchain.CurrentSnapBlock()
+	case ethconfig.ReceiptSync:
+		// TODO: RACEAI: check if this is correct
+		chainHead = d.blockchain.CurrentBlock()
 	default:
 		panic("unknown sync mode")
 	}
@@ -198,6 +201,9 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 		linked = d.blockchain.GetCanonicalHash(num) == beaconTail.ParentHash && d.blockchain.HasBlock(beaconTail.ParentHash, num)
 	case ethconfig.SnapSync:
 		linked = d.blockchain.GetCanonicalHash(num) == beaconTail.ParentHash && d.blockchain.HasFastBlock(beaconTail.ParentHash, num)
+	case ethconfig.ReceiptSync:
+		// TODO: RACEAI: check if this is correct
+		linked = d.blockchain.HasBlock(beaconTail.ParentHash, beaconTail.Number.Uint64()-1)
 	default:
 		panic("unknown sync mode")
 	}
@@ -238,6 +244,9 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 			known = d.blockchain.GetCanonicalHash(n) == h.Hash() && d.blockchain.HasBlock(h.Hash(), n)
 		case ethconfig.SnapSync:
 			known = d.blockchain.GetCanonicalHash(n) == h.Hash() && d.blockchain.HasFastBlock(h.Hash(), n)
+		case ethconfig.ReceiptSync:
+			// TODO: RACEAI: check if this is correct
+			known = d.blockchain.HasBlock(h.Hash(), n)
 		default:
 			panic("unknown sync mode")
 		}
@@ -343,13 +352,16 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			continue
 		}
 		// If the pivot block is committed, signal header sync termination
-		if d.committed.Load() {
+		if d.committed.Load() && d.getMode() != ethconfig.ReceiptSync {
 			select {
 			case d.headerProcCh <- nil:
 				return nil
 			case <-d.cancelCh:
 				return errCanceled
 			}
+		}
+		if d.getMode() == ethconfig.ReceiptSync {
+			log.Info("RACE: ReceiptSync imported all available headers, waiting for new headers to arrive", "head", head.Number, "from", from)
 		}
 		// State sync still going, wait a bit for new headers and retry
 		log.Trace("Pivot not yet committed, waiting...")

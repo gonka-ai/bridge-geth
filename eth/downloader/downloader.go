@@ -30,6 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth/bridge"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -169,6 +170,8 @@ type Downloader struct {
 	syncStartTime  time.Time // Time instance when chain sync started
 	syncLogTime    time.Time // Time instance when status was last reported
 	syncLogStalls  uint64    // Fetcher rounds throttled by the result cache when status was last reported
+
+	receiptSyncCurrentBlock uint64
 }
 
 // BlockChain encapsulates functions required to sync a (full or snap) blockchain.
@@ -294,6 +297,8 @@ func (d *Downloader) Progress() ethereum.SyncProgress {
 		current = d.blockchain.CurrentBlock().Number.Uint64()
 	case ethconfig.SnapSync:
 		current = d.blockchain.CurrentSnapBlock().Number.Uint64()
+	case ethconfig.ReceiptSync:
+		current = d.receiptSyncCurrentBlock
 	default:
 		log.Error("Unknown downloader mode", "mode", mode)
 	}
@@ -383,7 +388,11 @@ func (d *Downloader) synchronise(beaconPing chan struct{}) (err error) {
 			}
 		}()
 	}
-	// Make sure only one goroutine is ever allowed past this point at once
+	// Obtain the sync mode used in this cycle. Bridge clients always run
+	// ReceiptSync inside the cycle: headers, bodies, and receipts are fetched,
+	// and state import is skipped.
+	mode := ethconfig.ReceiptSync
+	log.Info("Synchronising started", "mode", mode)
 	if !d.synchronising.CompareAndSwap(false, true) {
 		return errBusy
 	}
@@ -394,8 +403,6 @@ func (d *Downloader) synchronise(beaconPing chan struct{}) (err error) {
 		log.Info("Block synchronisation started")
 	}
 
-	// Obtain the synchronized used in this cycle
-	mode := d.moder.get(true)
 	defer func() {
 		// The snap-sync mode is usually already disabled right after the pivot
 		// commitment; this is the fallback for the cycles terminating without
@@ -544,6 +551,12 @@ func (d *Downloader) syncToHead(beaconPing chan struct{}) (err error) {
 	d.syncStatsChainHeight = height
 	d.syncStatsLock.Unlock()
 
+	// RACE: If we are in ReceiptSync mode, we need to fetch headers only from the beggining of the last epoch
+	if mode == ethconfig.ReceiptSync {
+		origin = latest.Number.Uint64() - 1
+		log.Info("RACE:ReceiptSync mode", "origin", origin)
+	}
+
 	// Ensure our origin point is below any snap sync pivot point
 	if mode == ethconfig.SnapSync {
 		if height <= uint64(fsMinFullBlocks) {
@@ -630,7 +643,10 @@ func (d *Downloader) syncToHead(beaconPing chan struct{}) (err error) {
 	// Initiate the sync using a concurrent header and content retrieval algorithm
 	d.queue.Prepare(chainOffset, mode)
 
-	// In beacon mode, headers are served by the skeleton syncer
+	// In beacon mode, headers are served by the skeleton syncer.
+	// Bodies, receipts, and best-effort access lists are fetched for every
+	// mode; only the importer differs. ReceiptSync posts receipts and never
+	// imports state.
 	fetchers := []func() error{
 		func() error { return d.fetchHeaders(origin + 1) },   // Headers are always retrieved
 		func() error { return d.fetchBodies(chainOffset) },   // Bodies are retrieved during normal and snap sync
@@ -643,6 +659,8 @@ func (d *Downloader) syncToHead(beaconPing chan struct{}) (err error) {
 		fetchers = append(fetchers, func() error { return d.processSnapSyncContent() })
 	} else if mode == ethconfig.FullSync {
 		fetchers = append(fetchers, func() error { return d.processFullSyncContent() })
+	} else if mode == ethconfig.ReceiptSync {
+		fetchers = append(fetchers, func() error { return d.processReceiptOnlyContent() })
 	}
 	return d.spawnSync(fetchers, beaconPing)
 }
@@ -669,6 +687,7 @@ func (d *Downloader) spawnSync(fetchers []func() error, beaconPing chan struct{}
 			// Close the queue when all fetchers have exited.
 			// This will cause the block processor to end when
 			// it has processed the queue.
+			log.Warn("Closing download queue as all fetchers have exited")
 			d.queue.Close()
 		}
 		if got := <-errc; got != nil {
@@ -678,6 +697,7 @@ func (d *Downloader) spawnSync(fetchers []func() error, beaconPing chan struct{}
 			}
 		}
 	}
+	log.Warn("Closing download queue as there is no more fetchers")
 	d.queue.Close()
 	d.Cancel()
 	return err
@@ -968,6 +988,61 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 		}
 		return fmt.Errorf("%w: %v", errInvalidChain, err)
 	}
+	return nil
+}
+
+// processReceiptOnlyContent takes fetch results from the queue and imports only the receipts
+func (d *Downloader) processReceiptOnlyContent() error {
+	for {
+		results := d.queue.Results(true)
+		if len(results) == 0 {
+			log.Warn("processReceiptOnlyContent: no results to import, exiting")
+			return nil
+		}
+		if d.chainInsertHook != nil {
+			d.chainInsertHook(results)
+		}
+		if err := d.importBlockReceiptResults(results); err != nil {
+			log.Error("processReceiptOnlyContent: importBlockReceiptResults failed", "err", err)
+			return err
+		}
+	}
+}
+
+func (d *Downloader) importBlockReceiptResults(results []*fetchResult) error {
+	// Check for any early termination requests
+	if len(results) == 0 {
+		return nil
+	}
+	select {
+	case <-d.quitCh:
+		return errCancelContentProcessing
+	default:
+	}
+
+	// Iterate over each block result and send to bridge.
+	// v1.17 stores downloaded receipts as raw RLP; decode them before classification.
+	for _, result := range results {
+		var receipts types.Receipts
+		if len(result.Receipts) > 0 {
+			var storageReceipts []*types.ReceiptForStorage
+			if err := rlp.DecodeBytes(result.Receipts, &storageReceipts); err != nil {
+				log.Error("Failed to decode receipts for bridge processing",
+					"number", result.Header.Number, "err", err)
+				continue
+			}
+			receipts = make(types.Receipts, len(storageReceipts))
+			for i, stored := range storageReceipts {
+				receipts[i] = (*types.Receipt)(stored)
+			}
+		}
+		if err := bridge.ProcessBlocks(receipts, result.Header, result.Transactions); err != nil {
+			log.Error("Failed to process block for bridge",
+				"number", result.Header.Number,
+				"err", err)
+		}
+	}
+
 	return nil
 }
 

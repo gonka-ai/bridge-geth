@@ -151,6 +151,10 @@ var (
 		utils.BeaconCheckpointFileFlag,
 		utils.LogSlowBlockFlag,
 		utils.StateSizeTrackingFlag, // deprecated
+		utils.BridgeAPIBaseFlag,
+		utils.BridgeTimeoutFlag,
+		utils.BridgePostBlockFlag,
+		utils.BridgeGetAddressesFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{

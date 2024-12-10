@@ -23,12 +23,13 @@ import "fmt"
 type SyncMode uint32
 
 const (
-	FullSync SyncMode = iota // Synchronise the entire blockchain history from full blocks
-	SnapSync                 // Download the chain and the state via compact snapshots
+	FullSync    SyncMode = iota // Synchronise the entire blockchain history from full blocks
+	SnapSync                    // Download the chain and the state via compact snapshots
+	ReceiptSync                 // New mode: Download headers and receipts only
 )
 
 func (mode SyncMode) IsValid() bool {
-	return mode == FullSync || mode == SnapSync
+	return mode == FullSync || mode == SnapSync || mode == ReceiptSync
 }
 
 // String implements the stringer interface.
@@ -38,6 +39,8 @@ func (mode SyncMode) String() string {
 		return "full"
 	case SnapSync:
 		return "snap"
+	case ReceiptSync:
+		return "receipt"
 	default:
 		return "unknown"
 	}
@@ -49,6 +52,8 @@ func (mode SyncMode) MarshalText() ([]byte, error) {
 		return []byte("full"), nil
 	case SnapSync:
 		return []byte("snap"), nil
+	case ReceiptSync:
+		return []byte("full"), nil
 	default:
 		return nil, fmt.Errorf("unknown sync mode %d", mode)
 	}

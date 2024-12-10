@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 )
 
 // resultStore implements a structure for maintaining fetchResults, tracking their
@@ -75,7 +76,7 @@ func (r *resultStore) SetThrottleThreshold(threshold uint64) uint64 {
 //	stale     - if true, this item is already passed, and should not be requested again
 //	throttled - if true, the store is at capacity, this particular header is not prio now
 //	item      - the result to store data into
-func (r *resultStore) AddFetch(header *types.Header, snapSync bool, fetchBAL bool) (stale, throttled bool, item *fetchResult) {
+func (r *resultStore) AddFetch(header *types.Header, mode SyncMode, fetchBAL bool) (stale, throttled bool, item *fetchResult) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
@@ -87,8 +88,11 @@ func (r *resultStore) AddFetch(header *types.Header, snapSync bool, fetchBAL boo
 		return stale, throttled, nil
 	}
 	if item == nil {
-		item = newFetchResult(header, snapSync, fetchBAL)
+		item = newFetchResult(header, mode, fetchBAL)
 		r.items[index] = item
+		log.Info("Adding new fetch result", "header", header.Number.Uint64(), "mode", mode, "index", index, "len(r.items)", len(r.items))
+	} else {
+		log.Info("Fetch result already exists", "header", header.Number.Uint64(), "mode", mode, "index", index, "len(r.items)", len(r.items))
 	}
 	return false, false, item
 }
