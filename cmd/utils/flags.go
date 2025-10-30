@@ -963,11 +963,6 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 	}
 
 	// Bridge settings
-	BridgeAPIBaseFlag = &cli.StringFlag{
-		Name:     "bridge.apibase",
-		Usage:    "Base URL for bridge API",
-		Category: flags.EthCategory,
-	}
 	BridgeTimeoutFlag = &cli.DurationFlag{
 		Name:     "bridge.timeout",
 		Usage:    "Timeout for bridge API requests",
@@ -976,14 +971,14 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 	}
 	BridgePostBlockFlag = &cli.StringFlag{
 		Name:     "bridge.postblock",
-		Usage:    "Endpoint for posting block data",
-		Value:    "/blocks",
+		Usage:    "URL for posting block data",
+		Value:    "",
 		Category: flags.EthCategory,
 	}
 	BridgeGetAddressesFlag = &cli.StringFlag{
 		Name:     "bridge.getaddresses",
-		Usage:    "Endpoint for getting contract addresses",
-		Value:    "/addresses",
+		Usage:    "URL for getting contract addresses",
+		Value:    "",
 		Category: flags.EthCategory,
 	}
 )
@@ -1596,9 +1591,6 @@ func setRequiredBlocks(ctx *cli.Context, cfg *ethconfig.Config) {
 
 func setBridge(ctx *cli.Context, cfg *ethconfig.Config) {
 	// Bridge configuration
-	if ctx.IsSet(BridgeAPIBaseFlag.Name) {
-		cfg.BridgeAPIBase = ctx.String(BridgeAPIBaseFlag.Name)
-	}
 	if ctx.IsSet(BridgeTimeoutFlag.Name) {
 		cfg.BridgeTimeout = ctx.Duration(BridgeTimeoutFlag.Name)
 	}

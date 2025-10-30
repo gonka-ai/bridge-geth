@@ -157,7 +157,6 @@ var (
 		utils.BeaconGenesisTimeFlag,
 		utils.BeaconCheckpointFlag,
 		utils.BeaconCheckpointFileFlag,
-		utils.BridgeAPIBaseFlag,
 		utils.BridgeTimeoutFlag,
 		utils.BridgePostBlockFlag,
 		utils.BridgeGetAddressesFlag,

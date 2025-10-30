@@ -153,8 +153,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		return nil, err
 	}
 
-	// Initialize bridge configuration if API base is provided
-	if config.BridgeAPIBase != "" {
+	// Initialize bridge configuration if any bridge URLs are provided
+	if config.BridgePostBlockEP != "" || config.BridgeGetAddressesEP != "" {
 		bridge.SetConfig(config, chainConfig)
 	}
 
