@@ -80,10 +80,9 @@ var Defaults = Config{
 	TxSyncMaxTimeout:        1 * time.Minute,
 	SlowBlockThreshold:      -1, // Disabled by default; set via --debug.logslowblock flag
 	RangeLimit:              0,
-	BridgeAPIBase:           "",
 	BridgeTimeout:           30 * time.Second,
-	BridgePostBlockEP:       "/blocks",
-	BridgeGetAddressesEP:    "/addresses",
+	BridgePostBlockEP:       "",
+	BridgeGetAddressesEP:    "",
 }
 
 //go:generate go run github.com/fjl/gencodec -type Config -formats toml -out gen_config.go
@@ -113,10 +112,9 @@ type Config struct {
 	NoPrecompileCache bool // Whether to disable precompile result caching
 
 	// Bridge settings
-	BridgeAPIBase        string        // Base URL for bridge API
 	BridgeTimeout        time.Duration // Timeout for bridge API requests
-	BridgePostBlockEP    string        // Endpoint for posting block data
-	BridgeGetAddressesEP string        // Endpoint for getting contract addresses
+	BridgePostBlockEP    string        // Full URL for posting block data
+	BridgeGetAddressesEP string        // Full URL for getting contract addresses
 
 	// Deprecated: use 'TransactionHistory' instead.
 	TxLookupLimit uint64 `toml:",omitempty"` // The maximum number of blocks from head whose tx indices are reserved.

@@ -151,7 +151,6 @@ var (
 		utils.BeaconCheckpointFileFlag,
 		utils.LogSlowBlockFlag,
 		utils.StateSizeTrackingFlag, // deprecated
-		utils.BridgeAPIBaseFlag,
 		utils.BridgeTimeoutFlag,
 		utils.BridgePostBlockFlag,
 		utils.BridgeGetAddressesFlag,
