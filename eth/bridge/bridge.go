@@ -34,14 +34,13 @@ func SetConfig(ethereumCfg *ethconfig.Config, chainCfg *params.ChainConfig) {
 		ethereumConfig = ethereumCfg
 		chainConfig = chainCfg
 		// Add logging to verify the bridge API configuration
-		if ethereumConfig.BridgeAPIBase != "" {
+		if ethereumConfig.BridgePostBlockEP != "" || ethereumConfig.BridgeGetAddressesEP != "" {
 			log.Info("Bridge configuration initialized",
-				"apiBase", ethereumConfig.BridgeAPIBase,
 				"timeout", ethereumConfig.BridgeTimeout,
-				"postBlockEP", ethereumConfig.BridgePostBlockEP,
-				"getAddressesEP", ethereumConfig.BridgeGetAddressesEP)
+				"postBlockURL", ethereumConfig.BridgePostBlockEP,
+				"getAddressesURL", ethereumConfig.BridgeGetAddressesEP)
 		} else {
-			log.Warn("Bridge API base URL not set")
+			log.Warn("Bridge URLs not set")
 		}
 	})
 }
@@ -77,12 +76,12 @@ type BlockInfo struct {
 
 // getBridgeContractAddresses returns all bridge contract addresses, fetching them from API each time
 func getBridgeContractAddresses(ctx context.Context) ([]common.Address, error) {
-	if ethereumConfig == nil || ethereumConfig.BridgeAPIBase == "" {
+	if ethereumConfig == nil || ethereumConfig.BridgeGetAddressesEP == "" {
 		return nil, fmt.Errorf("bridge API not configured")
 	}
 
 	// Build the full URL for fetching addresses with query parameter
-	url := ethereumConfig.BridgeAPIBase + ethereumConfig.BridgeGetAddressesEP + "?chain=ethereum"
+	url := ethereumConfig.BridgeGetAddressesEP + "?chain=ethereum"
 
 	// Send request to fetch contract addresses (no payload needed for GET request)
 	resp, err := sendToEndpoint(ctx, url, nil, ethereumConfig.BridgeTimeout)
@@ -211,7 +210,7 @@ func recoverPublicKey(signer types.Signer, tx *types.Transaction) (string, error
 // sendBlockToBridge sends block details with filtered receipts to the bridge API
 func sendBlockToBridge(ctx context.Context, blockNum uint64, receiptsRoot common.Hash,
 	filteredReceipts []ReceiptData) error {
-	if ethereumConfig == nil || ethereumConfig.BridgeAPIBase == "" {
+	if ethereumConfig == nil || ethereumConfig.BridgePostBlockEP == "" {
 		return nil
 	}
 
@@ -230,7 +229,7 @@ func sendBlockToBridge(ctx context.Context, blockNum uint64, receiptsRoot common
 	}
 
 	// Build the full URL for posting blocks
-	url := ethereumConfig.BridgeAPIBase + ethereumConfig.BridgePostBlockEP
+	url := ethereumConfig.BridgePostBlockEP
 
 	// Send to the bridge API
 	resp, err := sendToEndpoint(ctx, url, jsonData, ethereumConfig.BridgeTimeout)
@@ -309,7 +308,7 @@ func StoreBlockInfo(number uint64, hash, receiptsRoot common.Hash) {
 // ProcessBlocks processes blocks and sends all blocks to the bridge API
 // If the block contains filtered transfers, those receipts are included in the request
 func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions types.Transactions) error {
-	if ethereumConfig == nil || ethereumConfig.BridgeAPIBase == "" {
+	if ethereumConfig == nil || ethereumConfig.BridgePostBlockEP == "" || ethereumConfig.BridgeGetAddressesEP == "" {
 		// No API configured, skip processing
 		return nil
 	}
