@@ -16,6 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // Add these variables at the package level
@@ -307,18 +308,26 @@ func StoreBlockInfo(number uint64, hash, receiptsRoot common.Hash) {
 
 // ProcessBlocks processes blocks and sends all blocks to the bridge API
 // If the block contains filtered transfers, those receipts are included in the request
-func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions types.Transactions) error {
-	if ethereumConfig == nil || ethereumConfig.BridgePostBlockEP == "" || ethereumConfig.BridgeGetAddressesEP == "" {
-		// No API configured, skip processing
-		return nil
-	}
+func ProcessBlocks(receiptsRaw rlp.RawValue, header *types.Header, transactions types.Transactions) error {
+    if ethereumConfig == nil || ethereumConfig.BridgePostBlockEP == "" || ethereumConfig.BridgeGetAddressesEP == "" {
+        // No API configured, skip processing
+        return nil
+    }
 
-	if header == nil {
-		return nil
-	}
+    if header == nil {
+        return nil
+    }
 
-	blockNum := header.Number.Uint64()
-	ctx := context.Background()
+    // Decode the receipts from RLP
+    var receipts types.Receipts
+    if len(receiptsRaw) > 0 {
+        if err := rlp.DecodeBytes(receiptsRaw, &receipts); err != nil {
+            return fmt.Errorf("failed to decode receipts RLP: %w", err)
+        }
+    }
+
+    blockNum := header.Number.Uint64()
+    ctx := context.Background()
 
 	// Get the bridge contract addresses from API
 	bridgeContractAddresses, err := getBridgeContractAddresses(ctx)
@@ -335,7 +344,7 @@ func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions t
 		return nil
 	}
 
-	log.Info("Bridge: Processing block",
+    log.Info("Bridge: Processing block",
 		"number", blockNum,
 		"hash", header.Hash().Hex(),
 		"receipts_count", len(receipts),
