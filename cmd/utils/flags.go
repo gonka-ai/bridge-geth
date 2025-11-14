@@ -1625,12 +1625,29 @@ func setBridge(ctx *cli.Context, cfg *ethconfig.Config) {
 	// Bridge configuration
 	if ctx.IsSet(BridgeTimeoutFlag.Name) {
 		cfg.BridgeTimeout = ctx.Duration(BridgeTimeoutFlag.Name)
+		log.Info("Bridge timeout flag set", "timeout", cfg.BridgeTimeout)
 	}
 	if ctx.IsSet(BridgePostBlockFlag.Name) {
 		cfg.BridgePostBlockEP = ctx.String(BridgePostBlockFlag.Name)
+		log.Info("Bridge post block URL flag set", "url", cfg.BridgePostBlockEP)
+	} else {
+		log.Warn("Bridge post block URL flag not set")
 	}
 	if ctx.IsSet(BridgeGetAddressesFlag.Name) {
 		cfg.BridgeGetAddressesEP = ctx.String(BridgeGetAddressesFlag.Name)
+		log.Info("Bridge get addresses URL flag set", "url", cfg.BridgeGetAddressesEP)
+	} else {
+		log.Warn("Bridge get addresses URL flag not set")
+	}
+
+	// Log summary of bridge configuration
+	if cfg.BridgePostBlockEP != "" || cfg.BridgeGetAddressesEP != "" {
+		log.Info("Bridge configuration parsed from flags",
+			"timeout", cfg.BridgeTimeout,
+			"postBlockURL", cfg.BridgePostBlockEP,
+			"getAddressesURL", cfg.BridgeGetAddressesEP)
+	} else {
+		log.Warn("Bridge URLs not configured - bridge functionality will be disabled")
 	}
 }
 

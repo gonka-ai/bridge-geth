@@ -183,10 +183,8 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		return nil, err
 	}
 
-	// Initialize bridge configuration if any bridge URLs are provided
-	if config.BridgePostBlockEP != "" || config.BridgeGetAddressesEP != "" {
-		bridge.SetConfig(config, chainConfig)
-	}
+	// Initialize bridge configuration (always call to ensure config is set, even if URLs are empty)
+	bridge.SetConfig(config, chainConfig)
 
 	engine, err := ethconfig.CreateConsensusEngine(chainConfig, chainDb)
 	if err != nil {
