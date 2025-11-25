@@ -356,18 +356,22 @@ func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions t
 			}
 
 			for _, logEntry := range receipt.Logs {
-				// Check if this is a USDT transfer log
+				// Check if this is an ERC20 Transfer log
 				if len(logEntry.Topics) < 3 || logEntry.Topics[0] != TransferSignature {
 					continue
 				}
 
-				// Extract transfer details
+				// Extract transfer recipient
 				to := common.BytesToAddress(logEntry.Topics[2].Bytes())
 
-				// Check if this transfer is to any of our bridge contracts
+				// Check if this log is relevant to any of our bridge addresses.
+				// We treat a log as relevant if EITHER:
+				//   1) The transfer recipient is a bridge address (classic deposit/lock), OR
+				//   2) The token contract emitting the Transfer event is a bridge address
+				//      (e.g. burns/withdrawals where tokens are sent to the zero address).
 				isBridgeTransfer := false
 				for _, bridgeAddr := range bridgeContractAddresses {
-					if to == bridgeAddr {
+					if to == bridgeAddr || logEntry.Address == bridgeAddr {
 						isBridgeTransfer = true
 						break
 					}
