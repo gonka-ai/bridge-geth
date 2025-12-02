@@ -27,6 +27,9 @@ var (
 	ethereumConfig *ethconfig.Config
 	chainConfig    *params.ChainConfig
 	configOnce     sync.Once
+
+	zeroAddress = common.Address{}
+	deadAddress = common.HexToAddress("0x000000000000000000000000000000000000dEaD")
 )
 
 func SetConfig(ethereumCfg *ethconfig.Config, chainCfg *params.ChainConfig) {
@@ -43,6 +46,41 @@ func SetConfig(ethereumCfg *ethconfig.Config, chainCfg *params.ChainConfig) {
 			log.Warn("Bridge URLs not set")
 		}
 	})
+}
+
+// isBurnAddress returns true if the address is the zero address or the dead address
+func isBurnAddress(addr common.Address) bool {
+	return addr == zeroAddress || addr == deadAddress
+}
+
+// classifyBridgeLog determines if a log is a deposit (lock) or burn (withdraw) related to the bridge
+func classifyBridgeLog(
+	logEntry *types.Log,
+	bridgeAddrs map[common.Address]struct{},
+) (isDeposit, isBurn bool) {
+	// Ensure this is an ERC20 Transfer log
+	if len(logEntry.Topics) < 3 || logEntry.Topics[0] != TransferSignature {
+		return false, false
+	}
+
+	from := common.BytesToAddress(logEntry.Topics[1].Bytes())
+	to := common.BytesToAddress(logEntry.Topics[2].Bytes())
+
+	// Case 1: Deposit / lock - user sends tokens TO the bridge contract
+	if _, ok := bridgeAddrs[to]; ok {
+		return true, false
+	}
+
+	// Case 2: Burn / withdraw - bridge token contract sends to a burn address
+	// Require:
+	//   - event emitted by a bridge token contract
+	//   - destination is a well-known burn address
+	//   - from is not zero (exclude mints for extra safety)
+	if _, ok := bridgeAddrs[logEntry.Address]; ok && isBurnAddress(to) && from != zeroAddress {
+		return false, true
+	}
+
+	return false, false
 }
 
 // ReceiptData represents a single receipt data to be sent to the bridge
@@ -335,6 +373,12 @@ func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions t
 		return nil
 	}
 
+	// Build a set for fast lookup of bridge addresses
+	bridgeAddrSet := make(map[common.Address]struct{}, len(bridgeContractAddresses))
+	for _, addr := range bridgeContractAddresses {
+		bridgeAddrSet[addr] = struct{}{}
+	}
+
 	log.Info("Bridge: Processing block",
 		"number", blockNum,
 		"hash", header.Hash().Hex(),
@@ -354,30 +398,10 @@ func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions t
 			if receipt == nil || len(receipt.Logs) == 0 {
 				continue
 			}
-
 			for _, logEntry := range receipt.Logs {
-				// Check if this is an ERC20 Transfer log
-				if len(logEntry.Topics) < 3 || logEntry.Topics[0] != TransferSignature {
-					continue
-				}
-
-				// Extract transfer recipient
-				to := common.BytesToAddress(logEntry.Topics[2].Bytes())
-
-				// Check if this log is relevant to any of our bridge addresses.
-				// We treat a log as relevant if EITHER:
-				//   1) The transfer recipient is a bridge address (classic deposit/lock), OR
-				//   2) The token contract emitting the Transfer event is a bridge address
-				//      (e.g. burns/withdrawals where tokens are sent to the zero address).
-				isBridgeTransfer := false
-				for _, bridgeAddr := range bridgeContractAddresses {
-					if to == bridgeAddr || logEntry.Address == bridgeAddr {
-						isBridgeTransfer = true
-						break
-					}
-				}
-
-				if !isBridgeTransfer {
+				// Classify this log as a deposit or burn (or neither)
+				isDeposit, isBurn := classifyBridgeLog(logEntry, bridgeAddrSet)
+				if !isDeposit && !isBurn {
 					continue
 				}
 
@@ -419,6 +443,8 @@ func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions t
 					continue
 				}
 
+				// Extract "to" address and amount from the log
+				to := common.BytesToAddress(logEntry.Topics[2].Bytes())
 				amount := new(big.Int).SetBytes(logEntry.Data)
 
 				// Add this receipt to our filtered list
@@ -432,7 +458,15 @@ func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions t
 
 				filteredReceipts = append(filteredReceipts, receiptData)
 
-				log.Info("Bridge: ERC20 transfer involving bridge contract detected",
+				// Choose a more specific log message based on the classification
+				msg := "Bridge: ERC20 transfer involving bridge contract detected"
+				if isDeposit {
+					msg = "Bridge: ERC20 deposit to bridge detected"
+				} else if isBurn {
+					msg = "Bridge: ERC20 burn from bridge detected"
+				}
+
+				log.Info(msg,
 					"token_contract", logEntry.Address.Hex(),
 					"publicKey", pubKey,
 					"from", from.Hex(),
