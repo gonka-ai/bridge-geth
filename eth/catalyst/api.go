@@ -276,7 +276,7 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 		log.Info("Forkchoice requested sync to new head", context...)
 		if api.eth.SyncMode() == ethconfig.ReceiptSync || api.eth.SyncMode() == ethconfig.FullSync {
 			if finalized != nil {
-				log.Info("RACE: Processing forkchoice update in ReceiptSync mode with finalized block",
+				log.Info("GONKA: Processing forkchoice update in ReceiptSync mode with finalized block",
 					"head", update.HeadBlockHash,
 					"finalized", update.FinalizedBlockHash)
 			}
@@ -553,8 +553,11 @@ func (api *ConsensusAPI) GetBlobsV1(hashes []common.Hash) ([]*engine.BlobAndProo
 // blob pool data.
 func (api *ConsensusAPI) GetBlobsV2(hashes []common.Hash) ([]*engine.BlobAndProofV2, error) {
 	head := api.eth.BlockChain().CurrentHeader()
-	if api.config().LatestFork(head.Time) < forks.Osaka {
-		return nil, unsupportedForkErr("engine_getBlobsV2 is not available before Osaka fork")
+	// GONKA: In ReceiptSync mode, we might not have the latest header time, so we skip the check
+	if api.eth.SyncMode() != ethconfig.ReceiptSync {
+		if api.config().LatestFork(head.Time) < forks.Osaka {
+			return nil, unsupportedForkErr("engine_getBlobsV2 is not available before Osaka fork")
+		}
 	}
 	if len(hashes) > 128 {
 		return nil, engine.TooLargeRequest.With(fmt.Errorf("requested blob count too large: %v", len(hashes)))
@@ -757,7 +760,7 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 	// into the database directly will conflict with the assumptions of snap sync
 	// that it has an empty db that it can fill itself.
 	if api.eth.SyncMode() != ethconfig.FullSync && api.eth.SyncMode() != ethconfig.ReceiptSync {
-		log.Info("NON-RACE: Delay payload because were not in full sync or receipt sync", "number", block.NumberU64(), "mode", api.eth.SyncMode())
+		log.Info("NON-GONKA: Delay payload because were not in full sync or receipt sync", "number", block.NumberU64(), "mode", api.eth.SyncMode())
 		return api.delayPayloadImport(block), nil
 	}
 
@@ -768,13 +771,13 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 		// We still need to check if the parent block exists to maintain chain integrity
 		if api.eth.BlockChain().GetBlock(block.ParentHash(), block.NumberU64()-1) == nil {
 			api.remoteBlocks.put(block.Hash(), block.Header())
-			log.Info("RACE: Parent block not available in ReceiptSync mode, accepting for now")
+			log.Info("GONKA: Parent block not available in ReceiptSync mode, accepting for now")
 			return engine.PayloadStatusV1{Status: engine.ACCEPTED}, nil
 		}
 
 		// For ReceiptSync, we're only interested in receipts, so we can mark as valid
 		// without inserting the block (which would fail without state)
-		log.Info("RACE: Considering block valid in ReceiptSync mode", "number", block.NumberU64(), "hash", block.Hash())
+		log.Info("GONKA: Considering block valid in ReceiptSync mode", "number", block.NumberU64(), "hash", block.Hash())
 		hash := block.Hash()
 		return engine.PayloadStatusV1{Status: engine.VALID, LatestValidHash: &hash}, nil
 	}
@@ -826,14 +829,14 @@ func (api *ConsensusAPI) delayPayloadImport(block *types.Block) engine.PayloadSt
 	// progress, try to extend it with the current payload request to relieve
 	// some strain from the forkchoice update.
 	// For ReceiptSync, use BeaconSync to force restart sync cycle
-	log.Warn("RACE: delayPayloadImport - BeaconSync", "mode", api.eth.SyncMode())
+	log.Warn("GONKA: delayPayloadImport - BeaconSync", "mode", api.eth.SyncMode())
 	//err := api.eth.Downloader().BeaconSync(api.eth.SyncMode(), block.Header(), nil)
 	err := api.eth.Downloader().BeaconExtend(api.eth.SyncMode(), block.Header())
 	if err == nil {
 		// Special handling for ReceiptSync mode - always mark blocks as valid
 		// This enables proper finality when we're only concerned with receipts
 		if api.eth.SyncMode() == ethconfig.ReceiptSync || api.eth.SyncMode() == ethconfig.FullSync {
-			log.Info("RACE-BAD: delayPayloadImport -Marking delayed payload as VALID in ReceiptSync mode", "number", block.NumberU64(), "hash", block.Hash())
+			log.Info("GONKA: delayPayloadImport - Marking delayed payload as VALID in ReceiptSync mode", "number", block.NumberU64(), "hash", block.Hash())
 			hash := block.Hash()
 			return engine.PayloadStatusV1{Status: engine.VALID, LatestValidHash: &hash}
 		}

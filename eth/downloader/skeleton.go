@@ -427,7 +427,7 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 					// If we receive a forced head update during suspend,
 					// we should accept it to avoid getting stuck
 					event.errc <- nil
-					log.Warn("RACE: Accepted forced head update during suspend",
+					log.Warn("GONKA: Accepted forced head update during suspend",
 						"number", event.header.Number,
 						"hash", event.header.Hash())
 					continue
@@ -715,7 +715,7 @@ func (s *skeleton) processCanonicalChain(final *types.Header) error {
 	}
 
 	if len(chain) == 0 {
-		return fmt.Errorf("RACE: no headers in canonical chain")
+		return fmt.Errorf("GONKA: no headers in canonical chain")
 	}
 
 	// Reverse the chain to process it from oldest to newest
@@ -732,14 +732,14 @@ func (s *skeleton) processCanonicalChain(final *types.Header) error {
 	if lastchain.Head+1 < firstNewNumber {
 		log.Warn("Gap detected in canonical chain", "head", lastchain.Head, "next", firstNewNumber)
 		// Don't return error, just skip this header
-		return fmt.Errorf("RACE: gap detected in canonical chain")
+		return fmt.Errorf("GONKA: gap detected in canonical chain")
 	}
 
 	// For non-genesis blocks, verify parent linkage
 	if parent := rawdb.ReadSkeletonHeader(s.db, firstNewNumber-1); parent == nil || parent.Hash() != firstNewHeader.ParentHash {
 		log.Warn("Non-sequential header in canonical chain", "number", firstNewNumber, "hash", firstNewHeader.Hash())
 		// Don't return error, just skip this header
-		return fmt.Errorf("RACE: non-sequential header in canonical chain")
+		return fmt.Errorf("GONKA: non-sequential header in canonical chain")
 	}
 
 	for _, header := range chain {

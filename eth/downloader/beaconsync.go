@@ -417,7 +417,7 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			}
 		}
 		if d.getMode() == ethconfig.ReceiptSync {
-			log.Info("RACE: ReceiptSync imported all available headers, waiting for new headers to arrive", "head", head.Number, "from", from)
+			log.Info("GONKA: ReceiptSync imported all available headers, waiting for new headers to arrive", "head", head.Number, "from", from)
 		}
 		// State sync still going, wait a bit for new headers and retry
 		log.Trace("Pivot not yet committed, waiting...")
