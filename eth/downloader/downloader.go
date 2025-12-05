@@ -551,10 +551,10 @@ func (d *Downloader) syncToHead(beaconPing chan struct{}) (err error) {
 	d.syncStatsChainHeight = height
 	d.syncStatsLock.Unlock()
 
-	// RACE: If we are in ReceiptSync mode, we need to fetch headers only from the beggining of the last epoch
+	// GONKA: If we are in ReceiptSync mode, we need to fetch headers only from the beggining of the last epoch
 	if mode == ethconfig.ReceiptSync {
 		origin = latest.Number.Uint64() - 1
-		log.Info("RACE:ReceiptSync mode", "origin", origin)
+		log.Info("GONKA: ReceiptSync mode", "origin", origin)
 	}
 
 	// Ensure our origin point is below any snap sync pivot point
@@ -1027,15 +1027,16 @@ func (d *Downloader) importBlockReceiptResults(results []*fetchResult) error {
 		if len(result.Receipts) > 0 {
 			var storageReceipts []*types.ReceiptForStorage
 			if err := rlp.DecodeBytes(result.Receipts, &storageReceipts); err != nil {
-				log.Error("Failed to decode receipts for bridge processing",
-					"number", result.Header.Number, "err", err)
+				log.Error("Failed to decode receipts for bridge processing", "err", err)
 				continue
 			}
 			receipts = make(types.Receipts, len(storageReceipts))
-			for i, stored := range storageReceipts {
-				receipts[i] = (*types.Receipt)(stored)
+			for i, r := range storageReceipts {
+				receipts[i] = (*types.Receipt)(r)
 			}
 		}
+
+		// Process blocks and receipts directly using the bridge package
 		if err := bridge.ProcessBlocks(receipts, result.Header, result.Transactions); err != nil {
 			log.Error("Failed to process block for bridge",
 				"number", result.Header.Number,
