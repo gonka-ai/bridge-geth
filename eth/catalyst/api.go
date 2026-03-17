@@ -639,8 +639,13 @@ func (api *ConsensusAPI) GetBlobsV1(ctx context.Context, hashes []common.Hash) (
 // Client software MUST return null if syncing or otherwise unable to serve
 // blob pool data.
 func (api *ConsensusAPI) GetBlobsV2(ctx context.Context, hashes []common.Hash) (engine.BlobAndProofListV2, error) {
-	// GONKA: In ReceiptSync mode, CurrentHeader() stays at Genesis, so skip the
-	// canonical-head fork check and let getBlobs return nil when blobs are absent.
+	// GONKA: In ReceiptSync mode, we might not have the latest header time, so we skip the check
+	/*
+		head := api.eth.BlockChain().CurrentHeader()
+		if api.config().LatestFork(head.Time) < forks.Osaka {
+			return nil, nil
+		}
+	*/
 	return api.getBlobs(ctx, hashes, true)
 }
 
@@ -648,6 +653,7 @@ func (api *ConsensusAPI) GetBlobsV2(ctx context.Context, hashes []common.Hash) (
 // GetBlobsV2, except will return partial responses in case there is a missing
 // blob.
 func (api *ConsensusAPI) GetBlobsV3(ctx context.Context, hashes []common.Hash) (engine.BlobAndProofListV2, error) {
+	// GONKA: Skip the canonical-head fork check in ReceiptSync mode as well.
 	return api.getBlobs(ctx, hashes, false)
 }
 
@@ -665,7 +671,6 @@ func (api *ConsensusAPI) getBlobs(ctx context.Context, hashes []common.Hash, v2 
 		span.SetAttributes(telemetry.IntAttribute("blobs.filled", filled))
 		spanEnd(&err)
 	}()
-
 	if len(hashes) > 128 {
 		return nil, engine.TooLargeRequest.With(fmt.Errorf("requested blob count too large: %v", len(hashes)))
 	}
