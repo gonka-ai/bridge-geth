@@ -552,13 +552,13 @@ func (api *ConsensusAPI) GetBlobsV1(hashes []common.Hash) ([]*engine.BlobAndProo
 // Client software MUST return null if syncing or otherwise unable to serve
 // blob pool data.
 func (api *ConsensusAPI) GetBlobsV2(hashes []common.Hash) ([]*engine.BlobAndProofV2, error) {
-	head := api.eth.BlockChain().CurrentHeader()
 	// GONKA: In ReceiptSync mode, we might not have the latest header time, so we skip the check
-	if api.eth.SyncMode() != ethconfig.ReceiptSync {
+	/*
+		head := api.eth.BlockChain().CurrentHeader()
 		if api.config().LatestFork(head.Time) < forks.Osaka {
 			return nil, unsupportedForkErr("engine_getBlobsV2 is not available before Osaka fork")
 		}
-	}
+	*/
 	if len(hashes) > 128 {
 		return nil, engine.TooLargeRequest.With(fmt.Errorf("requested blob count too large: %v", len(hashes)))
 	}

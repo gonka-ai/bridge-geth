@@ -602,6 +602,11 @@ func (s *Ethereum) Stop() error {
 // SyncMode retrieves the current sync mode, either explicitly set, or derived
 // from the chain status.
 func (s *Ethereum) SyncMode() ethconfig.SyncMode {
+	// If we are in ReceiptSync mode, return that directly
+	if s.config.SyncMode == ethconfig.ReceiptSync {
+		return ethconfig.ReceiptSync
+	}
+
 	// If we're in snap sync mode, return that directly
 	if s.handler.snapSync.Load() {
 		return ethconfig.SnapSync
