@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,17 +21,27 @@ import (
 
 // Add these variables at the package level
 var (
-	// New variables for block tracking
-	processedBlocks   = make(map[uint64]*BlockInfo) // map[blockNumber]*BlockInfo
-	processedBlocksMu sync.RWMutex
-
 	ethereumConfig *ethconfig.Config
 	chainConfig    *params.ChainConfig
 	configOnce     sync.Once
 
 	zeroAddress = common.Address{}
 	deadAddress = common.HexToAddress("0x000000000000000000000000000000000000dEaD")
+
+	// recentRanges is a rolling in-RAM history of the last N finalized ranges Geth
+	// has sent (N = ethereumConfig.BridgeMaxCachedRanges). It is the Layer-2 fast
+	// path that lets Geth resend shallow gaps without a devp2p re-download.
+	recentRanges   []FinalizedRange
+	recentRangesMu sync.Mutex
 )
+
+// FinalizedRange holds one download batch of payloads kept in memory for in-RAM
+// continuity recovery.
+type FinalizedRange struct {
+	StartBlock uint64
+	EndBlock   uint64
+	Blocks     []BlockRequest
+}
 
 func SetConfig(ethereumCfg *ethconfig.Config, chainCfg *params.ChainConfig) {
 	configOnce.Do(func() {
@@ -46,6 +57,10 @@ func SetConfig(ethereumCfg *ethconfig.Config, chainCfg *params.ChainConfig) {
 			log.Warn("Bridge URLs not set")
 		}
 	})
+}
+
+func IsConfigured() bool {
+	return ethereumConfig != nil && ethereumConfig.BridgePostBlockEP != "" && ethereumConfig.BridgeGetAddressesEP != ""
 }
 
 // isBurnAddress returns true if the address is the zero address or the dead address
@@ -103,15 +118,6 @@ type BlockRequest struct {
 // TransferSignature is the event signature for ERC20 Transfer events
 var TransferSignature = crypto.Keccak256Hash([]byte("Transfer(address,address,uint256)"))
 
-// Add new types and variables for block tracking
-type BlockInfo struct {
-	Number       uint64
-	Hash         common.Hash
-	ReceiptsRoot common.Hash
-	Finalized    bool
-	HasTransfers bool // Indicates if this block has relevant transfers
-}
-
 // getBridgeContractAddresses returns all bridge contract addresses, fetching them from API each time
 func getBridgeContractAddresses(ctx context.Context) ([]common.Address, error) {
 	if ethereumConfig == nil || ethereumConfig.BridgeGetAddressesEP == "" {
@@ -119,7 +125,7 @@ func getBridgeContractAddresses(ctx context.Context) ([]common.Address, error) {
 	}
 
 	// Build the full URL for fetching addresses with query parameter
-	url := ethereumConfig.BridgeGetAddressesEP + "?chain=ethereum"
+	url := ethereumConfig.BridgeGetAddressesEP + "?chain=" + ethereumConfig.BridgeChain
 
 	// Send request to fetch contract addresses (no payload needed for GET request)
 	resp, err := sendToEndpoint(ctx, url, nil, ethereumConfig.BridgeTimeout)
@@ -154,6 +160,84 @@ func getBridgeContractAddresses(ctx context.Context) ([]common.Address, error) {
 	log.Info("Fetched bridge contract addresses", "count", len(addresses), "chain_name", response.ChainName, "chain_id", response.ChainID)
 
 	return addresses, nil
+}
+
+// IsContinuityConfigured reports whether the optional "last confirmed block"
+// endpoint is set. When it is not set, the bridge behaves exactly as before
+// (no continuity enforcement) so a geth upgrade can ship before the cosmos
+// chain upgrade that exposes this endpoint.
+func IsContinuityConfigured() bool {
+	return ethereumConfig != nil && ethereumConfig.BridgeGetLastBlockEP != ""
+}
+
+// GetLastConfirmedBlock asks the cosmos chain for the last block it has confirmed
+// for the ethereum origin chain. It returns a tri-state result:
+//
+//   - ok == true, err == nil: the chain returned a confirmed block number; use it.
+//   - ok == false, err == nil: the feature is absent (endpoint unset, not
+//     implemented yet (404/501), or empty response). The caller must proceed as
+//     usual with no continuity enforcement.
+//   - ok == false, err != nil: the endpoint exists but the chain is unreachable
+//     (transport error, timeout, or 5xx). The caller should pause and retry,
+//     since this is exactly the cosmos-down / gap scenario.
+func GetLastConfirmedBlock(ctx context.Context) (block uint64, ok bool, err error) {
+	if !IsContinuityConfigured() {
+		return 0, false, nil
+	}
+
+	url := ethereumConfig.BridgeGetLastBlockEP + "?chain=" + ethereumConfig.BridgeChain
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		// Misconfigured URL: treat as feature absent rather than blocking forever.
+		log.Warn("Bridge: failed to build last-confirmed-block request, skipping continuity check", "url", url, "err", err)
+		return 0, false, nil
+	}
+
+	client := &http.Client{Timeout: ethereumConfig.BridgeTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		// Transport error (connection refused / timeout): cosmos is down.
+		return 0, false, fmt.Errorf("bridge last-confirmed-block endpoint unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented:
+		// Chain not upgraded yet: feature absent, proceed as usual.
+		log.Debug("Bridge: last-confirmed-block endpoint not implemented by chain, continuity check skipped", "status", resp.StatusCode)
+		return 0, false, nil
+	case resp.StatusCode >= 500:
+		// Server error: treat as cosmos temporarily down.
+		return 0, false, fmt.Errorf("bridge last-confirmed-block endpoint returned status %d", resp.StatusCode)
+	case resp.StatusCode != http.StatusOK:
+		return 0, false, fmt.Errorf("bridge last-confirmed-block endpoint returned status %d", resp.StatusCode)
+	}
+
+	// Unified schema: decode ONLY the `blockNumber` key (see §1.4 / Task 2). The
+	// public handshake endpoint returns { "chainId": ..., "blockNumber": ... },
+	// omitting blockNumber when the chain is uninitialized.
+	var response struct {
+		BlockNumber json.Number `json:"blockNumber"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return 0, false, fmt.Errorf("failed to decode last-confirmed-block response: %w", err)
+	}
+
+	raw := response.BlockNumber
+	if raw == "" {
+		// No block reported yet (fresh chain / empty response): feature present
+		// but nothing confirmed. Proceed as usual from the natural origin.
+		log.Debug("Bridge: chain reported no confirmed block yet, continuity check skipped")
+		return 0, false, nil
+	}
+
+	value, err := raw.Int64()
+	if err != nil || value < 0 {
+		return 0, false, fmt.Errorf("invalid last-confirmed-block value %q: %w", raw.String(), err)
+	}
+
+	log.Info("Bridge: chain reported last confirmed block", "lastConfirmed", value)
+	return uint64(value), true, nil
 }
 
 // recoverPublicKey recovers the full public key from a transaction
@@ -255,7 +339,7 @@ func sendBlockToBridge(ctx context.Context, blockNum uint64, receiptsRoot common
 	// Prepare request payload using the specified format
 	payload := BlockRequest{
 		BlockNumber:  fmt.Sprintf("%d", blockNum),
-		OriginChain:  "ethereum",
+		OriginChain:  ethereumConfig.BridgeChain,
 		ReceiptsRoot: receiptsRoot.Hex(),
 		Receipts:     filteredReceipts,
 	}
@@ -325,152 +409,112 @@ func sendToEndpoint(ctx context.Context, url string, jsonData []byte, timeout ti
 	return resp, nil
 }
 
-// Store block information for later finalization
-func StoreBlockInfo(number uint64, hash, receiptsRoot common.Hash) {
-	processedBlocksMu.Lock()
-	defer processedBlocksMu.Unlock()
-
-	processedBlocks[number] = &BlockInfo{
-		Number:       number,
-		Hash:         hash,
-		ReceiptsRoot: receiptsRoot,
-		Finalized:    false,
-		HasTransfers: false,
+// SaveRangeToMemory appends a new range to recentRanges and crops the slice to keep
+// only the latest BridgeMaxCachedRanges entries (the configurable in-RAM window).
+func SaveRangeToMemory(start, end uint64, blocks []BlockRequest) {
+	maxRanges := 4
+	if ethereumConfig != nil && ethereumConfig.BridgeMaxCachedRanges > 0 {
+		maxRanges = ethereumConfig.BridgeMaxCachedRanges
 	}
-	log.Debug("Stored block info for future finalization",
-		"number", number,
-		"hash", hash.Hex(),
-		"receiptsRoot", receiptsRoot.Hex())
+
+	recentRangesMu.Lock()
+	defer recentRangesMu.Unlock()
+	recentRanges = append(recentRanges, FinalizedRange{
+		StartBlock: start,
+		EndBlock:   end,
+		Blocks:     blocks,
+	})
+	if len(recentRanges) > maxRanges {
+		recentRanges = recentRanges[len(recentRanges)-maxRanges:]
+	}
 }
 
-// ProcessBlocks processes blocks and sends all blocks to the bridge API
-// If the block contains filtered transfers, those receipts are included in the request
-func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions types.Transactions) error {
-	if ethereumConfig == nil || ethereumConfig.BridgePostBlockEP == "" || ethereumConfig.BridgeGetAddressesEP == "" {
-		// No API configured, skip processing
-		return nil
-	}
-
-	if header == nil {
-		return nil
-	}
-
-	blockNum := header.Number.Uint64()
-	ctx := context.Background()
-
-	// Get the bridge contract addresses from API
-	bridgeContractAddresses, err := getBridgeContractAddresses(ctx)
+// GetBridgeContractAddresses fetches the bridge address list once and returns it as
+// a set for fast lookup. Used once per segment to avoid hammering the API per block.
+func GetBridgeContractAddresses(ctx context.Context) (map[common.Address]struct{}, error) {
+	addresses, err := getBridgeContractAddresses(ctx)
 	if err != nil {
-		log.Error("Failed to get bridge contract addresses", "err", err)
-		return err
+		return nil, err
 	}
-
-	// If no bridge contracts are configured, skip processing
-	if len(bridgeContractAddresses) == 0 {
-		log.Info("Bridge: No bridge contracts configured, skipping block processing",
-			"number", blockNum,
-			"hash", header.Hash().Hex())
-		return nil
+	set := make(map[common.Address]struct{}, len(addresses))
+	for _, addr := range addresses {
+		set[addr] = struct{}{}
 	}
+	return set, nil
+}
 
-	// Build a set for fast lookup of bridge addresses
-	bridgeAddrSet := make(map[common.Address]struct{}, len(bridgeContractAddresses))
-	for _, addr := range bridgeContractAddresses {
-		bridgeAddrSet[addr] = struct{}{}
+// PrepareBlockPayload filters a block's receipts for relevant bridge transfers and
+// returns the BlockRequest payload WITHOUT making any network request.
+func PrepareBlockPayload(header *types.Header, receipts types.Receipts, transactions types.Transactions, bridgeAddrSet map[common.Address]struct{}) (*BlockRequest, error) {
+	if header == nil {
+		return nil, nil
 	}
-
-	log.Info("Bridge: Processing block",
-		"number", blockNum,
-		"hash", header.Hash().Hex(),
-		"receipts_count", len(receipts),
-		"transactions_count", len(transactions))
-
-	// This will hold the filtered receipts
+	blockNum := header.Number.Uint64()
 	var filteredReceipts []ReceiptData
 
-	// If the block has receipts, filter them for relevant transfers
 	if len(receipts) > 0 {
-		// Create a signer to recover transaction senders
 		signer := types.MakeSigner(chainConfig, header.Number, header.Time)
-
-		// Iterate through block receipts to collect relevant transfers
 		for i, receipt := range receipts {
 			if receipt == nil || len(receipt.Logs) == 0 {
 				continue
 			}
 			for _, logEntry := range receipt.Logs {
-				// Classify this log as a deposit or burn (or neither)
 				isDeposit, isBurn := classifyBridgeLog(logEntry, bridgeAddrSet)
 				if !isDeposit && !isBurn {
 					continue
 				}
-
-				// Get the transaction by index (receipt index = transaction index)
 				if i >= len(transactions) {
 					log.Warn("Bridge: Transaction index out of range",
 						"receiptIndex", i,
 						"transactionCount", len(transactions),
-						"blockNumber", blockNum,
-						"blockHash", header.Hash().Hex(),
-						"receiptTxHash", receipt.TxHash.Hex())
+						"blockNumber", blockNum)
 					continue
 				}
-
 				tx := transactions[i]
-				log.Info("Bridge: Found matching transaction for receipt",
-					"receiptIndex", i,
-					"txHash", tx.Hash().Hex(),
-					"receiptTxHash", receipt.TxHash.Hex(),
-					"blockNumber", blockNum)
-
-				// Recover the sender and public key from the transaction
 				from, err := types.Sender(signer, tx)
 				if err != nil {
 					log.Warn("Bridge: Failed to recover transaction sender",
-						"txHash", tx.Hash().Hex(),
-						"receiptIndex", i,
-						"err", err)
+						"txHash", tx.Hash().Hex(), "receiptIndex", i, "err", err)
 					continue
 				}
-
-				// Get the full public key
 				pubKey, err := recoverPublicKey(signer, tx)
 				if err != nil {
 					log.Warn("Bridge: Failed to recover public key",
-						"txHash", tx.Hash().Hex(),
-						"receiptIndex", i,
-						"err", err)
+						"txHash", tx.Hash().Hex(), "receiptIndex", i, "err", err)
+					continue
+				}
+				amount := new(big.Int).SetBytes(logEntry.Data)
+				if amount.Sign() == 0 {
+					// ERC-20 allows zero-value transfers; Cosmos rejects amount=0 in
+					// MsgBridgeExchange.ValidateBasic, which would wedge the API drain.
+					log.Debug("Bridge: Skipping zero-amount transfer",
+						"token_contract", logEntry.Address.Hex(),
+						"from", from.Hex(),
+						"block", blockNum,
+						"index", i,
+						"isDeposit", isDeposit,
+						"isBurn", isBurn)
 					continue
 				}
 
-				// Extract "to" address and amount from the log
-				to := common.BytesToAddress(logEntry.Topics[2].Bytes())
-				amount := new(big.Int).SetBytes(logEntry.Data)
-
-				// Add this receipt to our filtered list
-				receiptData := ReceiptData{
-					Contract:     logEntry.Address.Hex(), // Use the token contract address
+				filteredReceipts = append(filteredReceipts, ReceiptData{
+					Contract:     logEntry.Address.Hex(),
 					Owner:        from.Hex(),
 					PublicKey:    pubKey,
 					Amount:       amount.String(),
 					ReceiptIndex: fmt.Sprintf("%d", i),
-				}
+				})
 
-				filteredReceipts = append(filteredReceipts, receiptData)
-
-				// Choose a more specific log message based on the classification
 				msg := "Bridge: ERC20 transfer involving bridge contract detected"
 				if isDeposit {
 					msg = "Bridge: ERC20 deposit to bridge detected"
 				} else if isBurn {
 					msg = "Bridge: ERC20 burn from bridge detected"
 				}
-
 				log.Info(msg,
 					"token_contract", logEntry.Address.Hex(),
 					"publicKey", pubKey,
 					"from", from.Hex(),
-					"to", to.Hex(),
 					"amount", amount.String(),
 					"block", blockNum,
 					"index", i)
@@ -479,14 +523,147 @@ func ProcessBlocks(receipts types.Receipts, header *types.Header, transactions t
 		}
 	}
 
-	log.Info("Block processing complete",
-		"number", blockNum,
-		"filtered_receipts", len(filteredReceipts))
+	return &BlockRequest{
+		BlockNumber:  fmt.Sprintf("%d", blockNum),
+		OriginChain:  ethereumConfig.BridgeChain,
+		ReceiptsRoot: header.ReceiptHash.Hex(),
+		Receipts:     filteredReceipts,
+	}, nil
+}
 
-	// Send block to bridge (even if no relevant receipts were found)
-	if err := sendBlockToBridge(ctx, blockNum, header.ReceiptHash, filteredReceipts); err != nil {
-		return err
+// CheckContinuityAndSend posts a downloaded segment to the bridge API while enforcing
+// the Layer-2 continuity invariant (see §1.6 / Task 4). blockX is the first block of
+// currentRange. On any handshake error or an uninitialized API it gracefully falls
+// back to legacy stateless posting (no caching, no restart).
+func CheckContinuityAndSend(ctx context.Context, blockX uint64, currentRange []BlockRequest) error {
+	if len(currentRange) == 0 {
+		return nil
 	}
 
+	apiLatest, ok, err := GetLastConfirmedBlock(ctx)
+	if err != nil || !ok {
+		// FAIL-SAFE: a handshake transport error or an uninitialized API both fall
+		// back to legacy stateless posting (no caching, no restart). Single fallback
+		// path; only the log line differs by cause.
+		if err != nil {
+			log.Warn("Bridge: handshake failed; falling back to legacy direct posting", "err", err)
+		} else {
+			log.Info("Bridge: API uninitialized; falling back to legacy direct posting")
+		}
+		return sendRangeDirectly(ctx, currentRange)
+	}
+
+	endBlock := parseUint(currentRange[len(currentRange)-1].BlockNumber)
+	expectedLatest := blockX - 1
+
+	// Case 1: sequential — API is exactly where we expect.
+	if apiLatest == expectedLatest {
+		if err := sendRangeDirectly(ctx, currentRange); err != nil {
+			return err
+		}
+		SaveRangeToMemory(blockX, endBlock, currentRange)
+		return nil
+	}
+
+	// Case 2: API is behind — try to heal from the in-RAM cache.
+	if apiLatest < expectedLatest {
+		// Snapshot the blocks to resend UNDER the lock, then release before any I/O (M2).
+		// Also require the cache to CONTIGUOUSLY cover [apiLatest+1 .. expectedLatest];
+		// a hole is treated like a deep gap (restart -> Layer 1 re-seed).
+		toResend, covered := snapshotContiguousResend(apiLatest+1, expectedLatest)
+		if !covered {
+			// log.Crit terminates the process; the supervisor restarts geth and
+			// receiptSyncOrigin (Layer 1) re-seeds origin from the API's progress.
+			log.Crit("Bridge continuity mismatch: gap is wider than memory capacity or non-contiguous; restarting geth to re-seed",
+				"apiLatest", apiLatest, "expected", expectedLatest)
+		}
+
+		// Lock released: send the resend snapshot, then the current range.
+		if err := sendRangeDirectly(ctx, toResend); err != nil {
+			return err
+		}
+		if err := sendRangeDirectly(ctx, currentRange); err != nil {
+			return err
+		}
+		// ORDERING INVARIANT: cache the incoming range ONLY after the resend (never
+		// before), otherwise we could evict a still-needed oldest range and trigger a
+		// spurious deep-gap restart.
+		SaveRangeToMemory(blockX, endBlock, currentRange)
+		return nil
+	}
+
+	// Case 3: API is ahead.
+	if apiLatest >= endBlock {
+		// Fully ahead: the API has already committed this whole segment. Skip sending
+		// and bypass caching (it will never be asked to resend these).
+		log.Info("Bridge: API is fully ahead of segment, skipping", "apiLatest", apiLatest, "endBlock", endBlock)
+		return nil
+	}
+
+	// Partially ahead: send only blocks > apiLatest and cache only those.
+	var sentBlocks []BlockRequest
+	for _, req := range currentRange {
+		blockNum := parseUint(req.BlockNumber)
+		if blockNum > apiLatest {
+			if err := sendBlockToBridge(ctx, blockNum, common.HexToHash(req.ReceiptsRoot), req.Receipts); err != nil {
+				return err
+			}
+			sentBlocks = append(sentBlocks, req)
+		}
+	}
+	if len(sentBlocks) > 0 {
+		SaveRangeToMemory(apiLatest+1, parseUint(sentBlocks[len(sentBlocks)-1].BlockNumber), sentBlocks)
+	}
 	return nil
+}
+
+// snapshotContiguousResend returns the cached blocks in [from..to] (inclusive), in
+// ascending order, but ONLY if the cache contiguously covers the whole range. It
+// holds recentRangesMu just long enough to copy (no network I/O under the lock, M2).
+func snapshotContiguousResend(from, to uint64) (blocks []BlockRequest, ok bool) {
+	if from > to {
+		return nil, true
+	}
+	recentRangesMu.Lock()
+	defer recentRangesMu.Unlock()
+	next := from
+	for _, r := range recentRanges {
+		for _, req := range r.Blocks {
+			bn := parseUint(req.BlockNumber)
+			if bn < from || bn > to {
+				continue
+			}
+			if bn != next {
+				return nil, false // hole -> not contiguous
+			}
+			blocks = append(blocks, req)
+			next++
+		}
+	}
+	if next != to+1 {
+		return nil, false // did not reach the end of the gap
+	}
+	return blocks, true
+}
+
+// sendRangeDirectly posts a range of blocks to the bridge API one block at a time,
+// in order, stopping at the first error (legacy stateless path).
+func sendRangeDirectly(ctx context.Context, rangeBlocks []BlockRequest) error {
+	for _, req := range rangeBlocks {
+		if err := sendBlockToBridge(ctx, parseUint(req.BlockNumber), common.HexToHash(req.ReceiptsRoot), req.Receipts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parseUint parses a decimal block number using the codebase standard (strconv),
+// surfacing errors via the log rather than silently yielding 0.
+func parseUint(s string) uint64 {
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		log.Error("Bridge: invalid block number in cached payload", "value", s, "err", err)
+		return 0
+	}
+	return v
 }

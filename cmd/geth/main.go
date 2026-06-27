@@ -159,6 +159,9 @@ var (
 		utils.BridgeTimeoutFlag,
 		utils.BridgePostBlockFlag,
 		utils.BridgeGetAddressesFlag,
+		utils.BridgeGetLastBlockFlag,
+		utils.BridgeChainFlag,
+		utils.BridgeCacheRangesFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{

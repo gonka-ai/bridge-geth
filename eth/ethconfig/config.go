@@ -49,32 +49,35 @@ var FullNodeGPO = gasprice.Config{
 
 // Defaults contains default settings for use on the Ethereum main net.
 var Defaults = Config{
-	HistoryMode:          history.KeepAll,
-	SyncMode:             SnapSync,
-	NetworkId:            0, // enable auto configuration of networkID == chainID
-	TxLookupLimit:        2350000,
-	TransactionHistory:   2350000,
-	LogHistory:           2350000,
-	StateHistory:         params.FullImmutabilityThreshold,
-	DatabaseCache:        512,
-	TrieCleanCache:       154,
-	TrieDirtyCache:       256,
-	TrieTimeout:          60 * time.Minute,
-	SnapshotCache:        102,
-	FilterLogCacheSize:   32,
-	LogQueryLimit:        1000,
-	Miner:                miner.DefaultConfig,
-	TxPool:               legacypool.DefaultConfig,
-	BlobPool:             blobpool.DefaultConfig,
-	RPCGasCap:            50000000,
-	RPCEVMTimeout:        5 * time.Second,
-	GPO:                  FullNodeGPO,
-	RPCTxFeeCap:          1, // 1 ether
-	TxSyncDefaultTimeout: 20 * time.Second,
-	TxSyncMaxTimeout:     1 * time.Minute,
-	BridgeTimeout:        30 * time.Second,
-	BridgePostBlockEP:    "",
-	BridgeGetAddressesEP: "",
+	HistoryMode:           history.KeepAll,
+	SyncMode:              SnapSync,
+	NetworkId:             0, // enable auto configuration of networkID == chainID
+	TxLookupLimit:         2350000,
+	TransactionHistory:    2350000,
+	LogHistory:            2350000,
+	StateHistory:          params.FullImmutabilityThreshold,
+	DatabaseCache:         512,
+	TrieCleanCache:        154,
+	TrieDirtyCache:        256,
+	TrieTimeout:           60 * time.Minute,
+	SnapshotCache:         102,
+	FilterLogCacheSize:    32,
+	LogQueryLimit:         1000,
+	Miner:                 miner.DefaultConfig,
+	TxPool:                legacypool.DefaultConfig,
+	BlobPool:              blobpool.DefaultConfig,
+	RPCGasCap:             50000000,
+	RPCEVMTimeout:         5 * time.Second,
+	GPO:                   FullNodeGPO,
+	RPCTxFeeCap:           1, // 1 ether
+	TxSyncDefaultTimeout:  20 * time.Second,
+	TxSyncMaxTimeout:      1 * time.Minute,
+	BridgeTimeout:         30 * time.Second,
+	BridgePostBlockEP:     "",
+	BridgeGetAddressesEP:  "",
+	BridgeGetLastBlockEP:  "",
+	BridgeChain:           "ethereum",
+	BridgeMaxCachedRanges: 4,
 }
 
 //go:generate go run github.com/fjl/gencodec -type Config -formats toml -out gen_config.go
@@ -103,9 +106,12 @@ type Config struct {
 	NoPrefetch bool // Whether to disable prefetching and only load state on demand
 
 	// Bridge settings
-	BridgeTimeout        time.Duration // Timeout for bridge API requests
-	BridgePostBlockEP    string        // Full URL for posting block data
-	BridgeGetAddressesEP string        // Full URL for getting contract addresses
+	BridgeTimeout         time.Duration // Timeout for bridge API requests
+	BridgePostBlockEP     string        // Full URL for posting block data
+	BridgeGetAddressesEP  string        // Full URL for getting contract addresses
+	BridgeGetLastBlockEP  string        // Full URL for querying the last block confirmed by the cosmos chain (optional; absent => no continuity enforcement)
+	BridgeChain           string        // Target chain name (default "ethereum")
+	BridgeMaxCachedRanges int           // Number of finalized ranges kept in memory for in-RAM continuity recovery (default 4; clamped >=1 when continuity is configured)
 
 	// Deprecated: use 'TransactionHistory' instead.
 	TxLookupLimit uint64 `toml:",omitempty"` // The maximum number of blocks from head whose tx indices are reserved.

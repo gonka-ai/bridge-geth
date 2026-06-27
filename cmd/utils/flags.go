@@ -1033,6 +1033,24 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 		Value:    "",
 		Category: flags.EthCategory,
 	}
+	BridgeGetLastBlockFlag = &cli.StringFlag{
+		Name:     "bridge.getlastblock",
+		Usage:    "URL for querying the last block confirmed by the cosmos chain (optional; if unset, no continuity enforcement)",
+		Value:    "",
+		Category: flags.EthCategory,
+	}
+	BridgeChainFlag = &cli.StringFlag{
+		Name:     "bridge.chain",
+		Usage:    "Target chain name for the bridge (default: \"ethereum\")",
+		Value:    "ethereum",
+		Category: flags.EthCategory,
+	}
+	BridgeCacheRangesFlag = &cli.IntFlag{
+		Name:     "bridge.cacheranges",
+		Usage:    "Number of finalized block ranges kept in memory for bridge continuity recovery (default 4)",
+		Value:    4,
+		Category: flags.EthCategory,
+	}
 )
 
 var (
@@ -1639,13 +1657,35 @@ func setBridge(ctx *cli.Context, cfg *ethconfig.Config) {
 	} else {
 		log.Warn("Bridge get addresses URL flag not set")
 	}
+	if ctx.IsSet(BridgeGetLastBlockFlag.Name) {
+		cfg.BridgeGetLastBlockEP = ctx.String(BridgeGetLastBlockFlag.Name)
+		log.Info("Bridge get last block URL flag set", "url", cfg.BridgeGetLastBlockEP)
+	} else {
+		log.Info("Bridge get last block URL flag not set - continuity enforcement disabled")
+	}
+	if ctx.IsSet(BridgeChainFlag.Name) {
+		cfg.BridgeChain = ctx.String(BridgeChainFlag.Name)
+		log.Info("Bridge chain flag set", "chain", cfg.BridgeChain)
+	}
+	if ctx.IsSet(BridgeCacheRangesFlag.Name) {
+		cfg.BridgeMaxCachedRanges = ctx.Int(BridgeCacheRangesFlag.Name)
+		log.Info("Bridge cache ranges flag set", "cacheRanges", cfg.BridgeMaxCachedRanges)
+	}
+	// When continuity is configured, the in-RAM cache window must be >= 1; a configured
+	// cache with zero RAM recovery would restart on every lag (§1.7). Clamp with a warning.
+	if cfg.BridgeGetLastBlockEP != "" && cfg.BridgeMaxCachedRanges < 1 {
+		log.Warn("Bridge: --bridge.cacheranges < 1 with continuity enabled; clamping to 1")
+		cfg.BridgeMaxCachedRanges = 1
+	}
 
 	// Log summary of bridge configuration
 	if cfg.BridgePostBlockEP != "" || cfg.BridgeGetAddressesEP != "" {
 		log.Info("Bridge configuration parsed from flags",
 			"timeout", cfg.BridgeTimeout,
 			"postBlockURL", cfg.BridgePostBlockEP,
-			"getAddressesURL", cfg.BridgeGetAddressesEP)
+			"getAddressesURL", cfg.BridgeGetAddressesEP,
+			"getLastBlockURL", cfg.BridgeGetLastBlockEP,
+			"chainID", cfg.BridgeChain)
 	} else {
 		log.Warn("Bridge URLs not configured - bridge functionality will be disabled")
 	}
