@@ -83,6 +83,9 @@ var Defaults = Config{
 	BridgeTimeout:           30 * time.Second,
 	BridgePostBlockEP:       "",
 	BridgeGetAddressesEP:    "",
+	BridgeGetLastBlockEP:    "",
+	BridgeChain:             "ethereum",
+	BridgeMaxCachedRanges:   4,
 }
 
 //go:generate go run github.com/fjl/gencodec -type Config -formats toml -out gen_config.go
@@ -112,9 +115,12 @@ type Config struct {
 	NoPrecompileCache bool // Whether to disable precompile result caching
 
 	// Bridge settings
-	BridgeTimeout        time.Duration // Timeout for bridge API requests
-	BridgePostBlockEP    string        // Full URL for posting block data
-	BridgeGetAddressesEP string        // Full URL for getting contract addresses
+	BridgeTimeout         time.Duration // Timeout for bridge API requests
+	BridgePostBlockEP     string        // Full URL for posting block data
+	BridgeGetAddressesEP  string        // Full URL for getting contract addresses
+	BridgeGetLastBlockEP  string        // Full URL for querying the last block confirmed by the cosmos chain (optional; absent => no continuity enforcement)
+	BridgeChain           string        // Target chain name (default "ethereum")
+	BridgeMaxCachedRanges int           // Number of finalized ranges kept in memory for in-RAM continuity recovery (default 4; clamped >=1 when continuity is configured)
 
 	// Deprecated: use 'TransactionHistory' instead.
 	TxLookupLimit uint64 `toml:",omitempty"` // The maximum number of blocks from head whose tx indices are reserved.
