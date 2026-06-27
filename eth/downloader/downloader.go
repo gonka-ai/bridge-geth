@@ -18,6 +18,7 @@
 package downloader
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -490,7 +491,10 @@ func (d *Downloader) syncToHead() (err error) {
 
 	// GONKA: If we are in ReceiptSync mode, we need to fetch headers only from the beggining of the last epoch
 	if mode == ethconfig.ReceiptSync {
-		origin = latest.Number.Uint64() - 1
+		origin, err = d.receiptSyncOrigin(latest)
+		if err != nil {
+			return err
+		}
 		log.Info("GONKA: ReceiptSync mode", "origin", origin)
 	}
 
@@ -608,6 +612,77 @@ func (d *Downloader) syncToHead() (err error) {
 			func() error { return d.processReceiptOnlyContent() })
 	}
 	return d.spawnSync(fetchers)
+}
+
+// receiptSyncOrigin computes the ReceiptSync starting origin.
+//
+// By default it is latest-1 (process the newest finalized block, preserving the
+// original behavior). When the optional bridge "last confirmed block" endpoint is
+// configured, it instead drives from the cosmos chain's last confirmed block C so
+// that any blocks the chain missed (e.g. while it was down) are re-fetched and
+// re-sent. The chain response is the single source of truth: each (re)start
+// derives origin from C, which is what makes a clean restart recover a gap.
+//
+// `latest` here is the beacon/skeleton head (from d.skeleton.Bounds()), NOT the
+// API's block/latest (C); they move independently, which is why we keep the explicit
+// C query for re-seeding.
+//
+// Tri-state behavior, matching bridge.GetLastConfirmedBlock:
+//   - endpoint absent / nothing confirmed yet: behave as before (origin = latest-1).
+//   - chain unreachable / down: FALLBACK to origin = latest-1 (Option B, §1.6) so the
+//     downloader never freezes and the Layer-2 in-RAM cache stays reachable.
+//   - C returned: origin = clamp(C, skeletonTail-1, latest-1). A deep gap below the
+//     skeleton tail forces a graceful restart so the skeleton can be re-seeded.
+func (d *Downloader) receiptSyncOrigin(latest *types.Header) (uint64, error) {
+	defaultOrigin := latest.Number.Uint64() - 1
+	if !bridge.IsContinuityConfigured() {
+		return defaultOrigin, nil
+	}
+
+	confirmed, ok, err := bridge.GetLastConfirmedBlock(context.Background())
+	if err != nil {
+		// Option B (§1.6): cosmos unreachable is a FALLBACK, not a pause. Proceed from
+		// latest-1 instead of freezing the cycle, so the in-RAM Layer-2 cache stays
+		// reachable and the downloader never freezes (§1.5). Next cycle re-seeds from C
+		// once cosmos is back.
+		log.Warn("Bridge continuity: cosmos chain unreachable, proceeding from latest-1 (fallback)", "err", err)
+		return defaultOrigin, nil
+	}
+	if !ok {
+		// Feature absent (chain not upgraded) or nothing confirmed yet: as before.
+		return defaultOrigin, nil
+	}
+
+	_, oldest, _, err := d.skeleton.Bounds()
+	if err != nil {
+		return 0, err
+	}
+	tail := oldest.Number.Uint64()
+
+	// Deep gap: the skeleton no longer holds headers for [confirmed+1, tail), so we
+	// cannot re-drive that range in-process. Force a graceful exit; the supervisor
+	// (bridge script.sh) restarts geth and the fresh skeleton re-derives origin.
+	if confirmed+1 < tail {
+		log.Crit("Bridge continuity: last confirmed block is below skeleton tail; restarting geth to re-seed",
+			"lastConfirmed", confirmed, "skeletonTail", tail, "skeletonHead", latest.Number.Uint64())
+	}
+
+	minOrigin := uint64(0)
+	if tail > 0 {
+		minOrigin = tail - 1
+	}
+	origin := confirmed
+	if origin < minOrigin {
+		origin = minOrigin
+	}
+	if origin > defaultOrigin {
+		origin = defaultOrigin
+	}
+	if origin < defaultOrigin {
+		log.Warn("Bridge continuity: gap detected, re-driving ReceiptSync from last confirmed block",
+			"lastConfirmed", confirmed, "from", origin+1, "to", latest.Number.Uint64())
+	}
+	return origin, nil
 }
 
 // spawnSync runs d.process and all given fetcher functions to completion in
@@ -911,8 +986,31 @@ func (d *Downloader) importBlockReceiptResults(results []*fetchResult) error {
 	default:
 	}
 
-	// Iterate over each block result and send to bridge
+	if !bridge.IsConfigured() {
+		return nil
+	}
+
+	ctx := context.Background()
+
+	// 1. Fetch contract addresses once for the entire segment.
+	// (If the API is down this fails and the cycle returns an error — acceptable,
+	// since payloads can't be built without addresses; Layer 1 re-seeds next cycle.)
+	bridgeAddrSet, err := bridge.GetBridgeContractAddresses(ctx)
+	if err != nil {
+		log.Error("Bridge: Failed to fetch contract addresses for segment", "err", err)
+		return err
+	}
+
+	var payloads []bridge.BlockRequest
+	startBlock := results[0].Header.Number.Uint64()
+
+	// 2. Build the payload batch sequentially (ascending order).
 	for _, result := range results {
+		if err := d.ensureBridgeReceiptResultFinalized(result); err != nil {
+			log.Error("Refusing to process non-finalized block for bridge", "err", err)
+			return err
+		}
+
 		var receipts types.Receipts
 		if len(result.Receipts) > 0 {
 			var storageReceipts []*types.ReceiptForStorage
@@ -926,14 +1024,55 @@ func (d *Downloader) importBlockReceiptResults(results []*fetchResult) error {
 			}
 		}
 
-		// Process blocks and receipts directly using the bridge package
-		if err := bridge.ProcessBlocks(receipts, result.Header, result.Transactions); err != nil {
-			log.Error("Failed to process block for bridge",
-				"number", result.Header.Number,
-				"err", err)
+		payload, err := bridge.PrepareBlockPayload(result.Header, receipts, result.Transactions, bridgeAddrSet)
+		if err != nil {
+			log.Error("Bridge: Failed to prepare block payload", "number", result.Header.Number, "err", err)
+			return err
+		}
+		if payload != nil {
+			payloads = append(payloads, *payload)
 		}
 	}
 
+	// 3. Post the batch with strict continuity checks.
+	if len(payloads) > 0 {
+		if err := bridge.CheckContinuityAndSend(ctx, startBlock, payloads); err != nil {
+			// Do NOT return the error: log a warning and continue so Geth keeps syncing
+			// and can self-heal on subsequent ranges via its in-RAM cache once the API
+			// recovers.
+			log.Warn("Bridge: Continuity check or transmission failed; continuing sync to allow self-healing recovery",
+				"start", startBlock, "err", err)
+		}
+	}
+
+	return nil
+}
+
+func (d *Downloader) ensureBridgeReceiptResultFinalized(result *fetchResult) error {
+	if result == nil || result.Header == nil {
+		return errors.New("missing receipt result header")
+	}
+	if d.skeleton == nil {
+		return errors.New("missing skeleton finality source")
+	}
+	head, _, final, err := d.skeleton.Bounds()
+	if err != nil {
+		return fmt.Errorf("failed to read skeleton finality bounds: %w", err)
+	}
+	if final == nil {
+		return fmt.Errorf("no finalized skeleton header available for block %d [%s]", result.Header.Number.Uint64(), result.Header.Hash())
+	}
+	number := result.Header.Number.Uint64()
+	if number > final.Number.Uint64() {
+		return fmt.Errorf("block %d [%s] is above finalized skeleton block %d [%s]", number, result.Header.Hash(), final.Number.Uint64(), final.Hash())
+	}
+	canonical := d.skeleton.Header(number)
+	if canonical == nil {
+		return fmt.Errorf("missing skeleton header for block %d [%s], skeleton head %d [%s], finalized %d [%s]", number, result.Header.Hash(), head.Number.Uint64(), head.Hash(), final.Number.Uint64(), final.Hash())
+	}
+	if canonical.Hash() != result.Header.Hash() {
+		return fmt.Errorf("block %d hash mismatch: result %s, skeleton %s, finalized %d [%s]", number, result.Header.Hash(), canonical.Hash(), final.Number.Uint64(), final.Hash())
+	}
 	return nil
 }
 
