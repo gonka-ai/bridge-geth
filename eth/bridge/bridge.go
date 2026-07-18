@@ -532,24 +532,28 @@ func PrepareBlockPayload(header *types.Header, receipts types.Receipts, transact
 }
 
 // CheckContinuityAndSend posts a downloaded segment to the bridge API while enforcing
-// the Layer-2 continuity invariant (see §1.6 / Task 4). blockX is the first block of
-// currentRange. On any handshake error or an uninitialized API it gracefully falls
-// back to legacy stateless posting (no caching, no restart).
+// the Layer-2 continuity invariant. blockX is the first block of currentRange.
+//
+// GONKA: the API cursor C is authoritative. If the cursor endpoint exists but
+// cannot be read, this fails closed (no posting) so the caller stops the cycle
+// and retries from a re-read C. Legacy stateless posting remains only for the
+// compatibility case where no cursor is available at all (endpoint unset, not
+// implemented, or a genuinely uninitialized API).
 func CheckContinuityAndSend(ctx context.Context, blockX uint64, currentRange []BlockRequest) error {
 	if len(currentRange) == 0 {
 		return nil
 	}
 
 	apiLatest, ok, err := GetLastConfirmedBlock(ctx)
-	if err != nil || !ok {
-		// FAIL-SAFE: a handshake transport error or an uninitialized API both fall
-		// back to legacy stateless posting (no caching, no restart). Single fallback
-		// path; only the log line differs by cause.
-		if err != nil {
-			log.Warn("Bridge: handshake failed; falling back to legacy direct posting", "err", err)
-		} else {
-			log.Info("Bridge: API uninitialized; falling back to legacy direct posting")
-		}
+	if err != nil {
+		// The cursor exists but is unreadable: never post blindly past an unknown
+		// C. The caller ends the cycle and retries once C can be read again.
+		return fmt.Errorf("bridge cursor unreadable before posting: %w", err)
+	}
+	if !ok {
+		// No cursor available (feature absent or uninitialized API): legacy
+		// stateless posting for backward compatibility.
+		log.Info("Bridge: no delivery cursor available; posting range directly")
 		return sendRangeDirectly(ctx, currentRange)
 	}
 
@@ -572,10 +576,15 @@ func CheckContinuityAndSend(ctx context.Context, blockX uint64, currentRange []B
 		// a hole is treated like a deep gap (restart -> Layer 1 re-seed).
 		toResend, covered := snapshotContiguousResend(apiLatest+1, expectedLatest)
 		if !covered {
-			// log.Crit terminates the process; the supervisor restarts geth and
-			// receiptSyncOrigin (Layer 1) re-seeds origin from the API's progress.
-			log.Crit("Bridge continuity mismatch: gap is wider than memory capacity or non-contiguous; restarting geth to re-seed",
+			// GONKA: the in-RAM cache is an optional accelerator, not a correctness
+			// boundary — it can never contain a range whose POST failed before it
+			// was cached, and it vanishes on restart. Fail this cycle instead of
+			// killing the process: the next cycle re-seeds its origin from the API
+			// cursor C and re-downloads [C+1, F] from peers, while Geth keeps
+			// serving Prysm's Engine API.
+			log.Warn("Bridge: continuity gap not covered by memory cache; deferring to downloader re-seed",
 				"apiLatest", apiLatest, "expected", expectedLatest)
+			return fmt.Errorf("bridge continuity gap [%d..%d] not covered by memory cache", apiLatest+1, expectedLatest)
 		}
 
 		// Lock released: send the resend snapshot, then the current range.

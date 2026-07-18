@@ -693,7 +693,21 @@ func (s *skeleton) processNewHead(head *types.Header, final *types.Header) error
 			return nil
 		}
 		if s.progress.Finalized == nil || number > *s.progress.Finalized {
-			if err := s.processCanonicalChain(final); err != nil {
+			// GONKA: F is a marker, not a second download cursor. If the finalized
+			// header is already materialized in the skeleton (e.g. after a restart,
+			// or when F jumps over an already-stored contiguous region), verify the
+			// stored hash against Prysm's finalized hash and advance the marker
+			// directly — no in-memory chain building is needed or possible then.
+			if number <= s.progress.Subchains[0].Head {
+				stored := rawdb.ReadSkeletonHeader(s.db, number)
+				if stored == nil || stored.Hash() != final.Hash() {
+					log.Warn("GONKA: finalized header not verified in skeleton; will retry",
+						"finalized", number, "stored", stored != nil)
+					return nil
+				}
+				log.Info("GONKA: finalized marker advanced over stored skeleton headers",
+					"finalized", number, "head", s.progress.Subchains[0].Head)
+			} else if err := s.processCanonicalChain(final); err != nil {
 				log.Error("Failed to process canonical chain", "err", err)
 				log.Warn("GONKA: finalized not advanced; will retry when skeleton links",
 					"finalized", number)

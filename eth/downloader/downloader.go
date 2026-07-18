@@ -648,40 +648,51 @@ func (d *Downloader) syncToHead() (err error) {
 
 // receiptSyncOrigin computes the ReceiptSync starting origin.
 //
-// Send/download ceiling is skeleton finalized F (not tip). Origin is the block
-// before the first fetched header (fetch starts at origin+1).
+// GONKA: the API cursor C is the only delivery start cursor — the desired next
+// block is always C+1. The download/send ceiling F is enforced by the fetch
+// target, never by moving the origin. Origin is the block before the first
+// fetched header (fetch starts at origin+1).
 //
-//   - No continuity / cosmos down / no C yet: origin = F-1 (process newest finalized).
-//   - C returned: origin = clamp(C, skeletonTail-1, F).
-//     CASE B (F > C): origin = C → re-drive C+1…F.
-//     CASE A (C >= F): origin = F → fetch from F+1 with target F → idle until F moves.
-//
-// A deep gap below the skeleton tail still forces a graceful restart.
+//   - No continuity endpoint / API uninitialized: origin = F-1 (bootstrap from
+//     the newest finalized block; initialize the API cursor to B-1 to select an
+//     explicit bootstrap block B instead).
+//   - C readable: origin = C.
+//     CASE B (F > C): deliver exactly (C, F] in ascending order.
+//     CASE A (C >= F): fetch from C+1 with target F → idle until F moves above C.
+//   - C unreadable: pause and retry. Losing the cursor never grants permission
+//     to pick a different start.
 func (d *Downloader) receiptSyncOrigin(latest *types.Header, final *types.Header) (uint64, error) {
 	defaultOrigin := latest.Number.Uint64() - 1
-	maxOrigin := defaultOrigin
 	if final != nil {
-		fin := final.Number.Uint64()
-		if fin > 0 {
-			defaultOrigin = fin - 1 // process through F when no C
+		if fin := final.Number.Uint64(); fin > 0 {
+			defaultOrigin = fin - 1 // bootstrap: deliver from the newest finalized block
 		} else {
 			defaultOrigin = 0
 		}
-		// Allow origin == F so CASE A idles (from=F+1 > target=F).
-		maxOrigin = fin
 	}
 
 	if !bridge.IsContinuityConfigured() {
 		return defaultOrigin, nil
 	}
 
+	// GONKA: C is authoritative. If the endpoint exists but cannot be read,
+	// pause delivery and keep retrying instead of falling back to an F-derived
+	// origin or direct posting.
 	confirmed, ok, err := bridge.GetLastConfirmedBlock(context.Background())
-	if err != nil {
-		// Option B (§1.6): cosmos unreachable is a FALLBACK, not a pause.
-		log.Warn("Bridge continuity: cosmos chain unreachable, proceeding from finalized-1 (fallback)", "err", err)
-		return defaultOrigin, nil
+	for err != nil {
+		log.Warn("GONKA: bridge cursor unreadable; pausing ReceiptSync until it recovers", "err", err)
+		select {
+		case <-time.After(fsHeaderContCheck):
+		case <-d.cancelCh:
+			return 0, errCanceled
+		case <-d.quitCh:
+			return 0, errCanceled
+		}
+		confirmed, ok, err = bridge.GetLastConfirmedBlock(context.Background())
 	}
 	if !ok {
+		// API reachable but reports no cursor yet (fresh chain or endpoint not
+		// implemented): bootstrap from the newest finalized block.
 		return defaultOrigin, nil
 	}
 
@@ -689,50 +700,42 @@ func (d *Downloader) receiptSyncOrigin(latest *types.Header, final *types.Header
 	if err != nil {
 		return 0, err
 	}
-	tail := oldest.Number.Uint64()
-
-	// Deep gap: the skeleton no longer holds headers for [confirmed+1, tail).
-	if confirmed+1 < tail {
-		log.Crit("Bridge continuity: last confirmed block is below skeleton tail; restarting geth to re-seed",
-			"lastConfirmed", confirmed, "skeletonTail", tail, "skeletonHead", latest.Number.Uint64())
+	origin, err := receiptSyncOriginFromCursor(confirmed, oldest.Number.Uint64())
+	if err != nil {
+		// Deep gap: the skeleton no longer retains [C+1, tail). Fail this sync
+		// cycle and retry later instead of killing the process — skeleton keeps
+		// serving Prysm and the next cycle re-reads C.
+		log.Error("GONKA: bridge cursor below retained skeleton window; retrying later",
+			"lastConfirmed", confirmed, "skeletonTail", oldest.Number.Uint64(), "skeletonHead", latest.Number.Uint64())
+		return 0, err
 	}
 
-	origin := clampReceiptSyncOrigin(confirmed, tail, maxOrigin)
-
-	to := maxOrigin
+	to := latest.Number.Uint64()
 	if final != nil {
 		to = final.Number.Uint64()
 	}
 	if confirmed >= to {
-		// CASE A: API cursor is at/ahead of skeleton finality — wait for F.
-		log.Info("GONKA: CASE A idle — API latest at/above skeleton finalized; waiting for F",
-			"lastConfirmed", confirmed, "finalized", to, "head", latest.Number.Uint64(), "origin", origin)
-	} else if origin <= confirmed && confirmed < to {
-		// CASE B: F > C — re-drive from C+1 through F (cursor rewind, F unchanged).
-		log.Info("GONKA: CASE B re-drive — skeleton finalized ahead of API latest; syncing (C,F]",
+		// CASE A: API cursor at/above skeleton finality — keep next=C+1 and idle
+		// until F moves above C (no download below C+1, none above F).
+		log.Info("GONKA: CASE A idle — API cursor at/above skeleton finalized; waiting for F",
+			"lastConfirmed", confirmed, "finalized", to, "head", latest.Number.Uint64())
+	} else {
+		// CASE B: F > C — deliver exactly (C, F] in ascending order.
+		log.Info("GONKA: CASE B — delivering (C, F]",
 			"lastConfirmed", confirmed, "from", origin+1, "to", to, "head", latest.Number.Uint64())
-	} else if origin < defaultOrigin {
-		log.Warn("GONKA: ReceiptSync origin clamped for finalized window",
-			"lastConfirmed", confirmed, "from", origin+1, "to", to)
 	}
 	return origin, nil
 }
 
-// clampReceiptSyncOrigin bounds the API cursor C to the retained skeleton
-// window and the finalized download ceiling F.
-func clampReceiptSyncOrigin(confirmed, tail, maxOrigin uint64) uint64 {
-	minOrigin := uint64(0)
-	if tail > 0 {
-		minOrigin = tail - 1
+// receiptSyncOriginFromCursor converts the API cursor C into a downloader
+// origin. The next block to deliver is always C+1; if the skeleton no longer
+// retains that block, the caller must retry later rather than pick a
+// different start.
+func receiptSyncOriginFromCursor(confirmed, tail uint64) (uint64, error) {
+	if confirmed+1 < tail {
+		return 0, fmt.Errorf("bridge cursor %d below retained skeleton tail %d", confirmed, tail)
 	}
-	origin := confirmed
-	if origin < minOrigin {
-		origin = minOrigin
-	}
-	if origin > maxOrigin {
-		origin = maxOrigin
-	}
-	return origin
+	return confirmed, nil
 }
 
 // spawnSync runs d.process and all given fetcher functions to completion in
@@ -1089,11 +1092,15 @@ func (d *Downloader) importBlockReceiptResults(results []*fetchResult) error {
 	// 3. Post the batch with strict continuity checks.
 	if len(payloads) > 0 {
 		if err := bridge.CheckContinuityAndSend(ctx, startBlock, payloads); err != nil {
-			// Do NOT return the error: log a warning and continue so Geth keeps syncing
-			// and can self-heal on subsequent ranges via its in-RAM cache once the API
-			// recovers.
-			log.Warn("Bridge: Continuity check or transmission failed; continuing sync to allow self-healing recovery",
+			// GONKA: a failed or unconfirmed POST must stop consumption of later
+			// result batches — otherwise the failed range is lost and continuity
+			// can never recover. Returning the error ends this sync cycle; the
+			// next cycle re-reads the API cursor C and re-drives from C+1, so a
+			// timed-out-but-committed POST is skipped and an uncommitted one is
+			// retried. Never kill the process over an API failure.
+			log.Warn("Bridge: delivery unconfirmed; stopping cycle to retry from API cursor",
 				"start", startBlock, "err", err)
+			return err
 		}
 	}
 

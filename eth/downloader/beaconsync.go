@@ -283,6 +283,13 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 	return start, nil
 }
 
+// receiptSyncScheduleWindow bounds how many blocks above the cycle origin a
+// single ReceiptSync cycle may schedule. The origin is seeded from the API
+// cursor C, so a large (C, F] backlog is drained in acknowledgement-driven
+// windows: download → deliver → confirm → next cycle opens the next window.
+// This keeps memory bounded and lets API throughput control downloader pace.
+const receiptSyncScheduleWindow = 2048
+
 // fetchHeaders feeds skeleton headers to the downloader queue for scheduling
 // until sync errors or is finished.
 func (d *Downloader) fetchHeaders(from uint64) error {
@@ -290,6 +297,8 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 	if err != nil {
 		return err
 	}
+	// GONKA: remember the cycle origin to bound the ReceiptSync catch-up window.
+	cycleBase := from - 1
 	// A part of headers are not in the skeleton space, try to resolve
 	// them from the local chain. Note the range should be very short
 	// and it should only happen when there are less than 64 post-merge
@@ -341,6 +350,14 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 		target, err := beaconHeaderTarget(d.getMode(), head, final)
 		if err != nil {
 			return err
+		}
+		// GONKA: bound each ReceiptSync cycle to a window above the API-cursor
+		// origin so a large (C, F] backlog is not scheduled all at once while
+		// deliveries are unconfirmed.
+		windowCapped := false
+		if d.getMode() == ethconfig.ReceiptSync && target > cycleBase+receiptSyncScheduleWindow {
+			target = cycleBase + receiptSyncScheduleWindow
+			windowCapped = true
 		}
 		// If the pivot became stale (older than 2*64-8 (bit of wiggle room)),
 		// move it ahead to HEAD-64
@@ -426,6 +443,20 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			}
 		}
 		if d.getMode() == ethconfig.ReceiptSync {
+			if windowCapped {
+				// The bounded window is fully scheduled. Finish this cycle cleanly
+				// so queued results drain through delivery; the next cycle re-reads
+				// the API cursor C and opens the following window from C+1 only
+				// after the API confirmed progress.
+				log.Info("GONKA: ReceiptSync window fully scheduled; completing cycle",
+					"windowStart", cycleBase+1, "windowEnd", target, "finalized", final.Number)
+				select {
+				case d.headerProcCh <- nil:
+					return nil
+				case <-d.cancelCh:
+					return errCanceled
+				}
+			}
 			log.Info("GONKA: ReceiptSync imported all available finalized headers, waiting",
 				"head", head.Number, "finalized", target, "from", from)
 		}

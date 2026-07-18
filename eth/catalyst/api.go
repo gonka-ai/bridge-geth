@@ -263,6 +263,23 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 		// If the finalized hash is known, we can direct the downloader to move
 		// potentially more data to the freezer from the get go.
 		finalized := api.remoteBlocks.get(update.FinalizedBlockHash)
+		// GONKA: remoteBlocks only retains the ~96 most recent headers, so after a
+		// restart or a fast Prysm catch-up the finalized header is typically older
+		// than that window and the lookup above returns nil even though Prysm sent
+		// a valid nonzero hash. Resolve it from peers by hash (same as the head
+		// above) so the skeleton receives a real finalized target instead of nil.
+		if finalized == nil && update.FinalizedBlockHash != (common.Hash{}) {
+			log.Warn("Fetching the unknown finalized header from network", "hash", update.FinalizedBlockHash)
+			retrievedFinal, err := api.eth.Downloader().GetHeader(update.FinalizedBlockHash)
+			if err != nil {
+				// Not fatal: sync proceeds with final=nil and the finalized marker
+				// is retried on the next forkchoice update.
+				log.Warn("Could not retrieve unknown finalized header from peers", "hash", update.FinalizedBlockHash)
+			} else {
+				api.remoteBlocks.put(retrievedFinal.Hash(), retrievedFinal)
+				finalized = retrievedFinal
+			}
+		}
 
 		// Header advertised via a past newPayload request. Start syncing to it.
 		context := []interface{}{"number", header.Number, "hash", header.Hash()}
