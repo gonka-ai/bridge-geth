@@ -17,6 +17,7 @@
 package downloader
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -285,7 +286,7 @@ func (d *Downloader) findBeaconAncestor() (uint64, error) {
 // fetchHeaders feeds skeleton headers to the downloader queue for scheduling
 // until sync errors or is finished.
 func (d *Downloader) fetchHeaders(from uint64) error {
-	head, tail, _, err := d.skeleton.Bounds()
+	head, tail, final, err := d.skeleton.Bounds()
 	if err != nil {
 		return err
 	}
@@ -329,7 +330,15 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 	for {
 		// Some beacon headers might have appeared since the last cycle, make
 		// sure we're always syncing to all available ones
-		head, _, _, err = d.skeleton.Bounds()
+		head, _, final, err = d.skeleton.Bounds()
+		if err != nil {
+			return err
+		}
+		// GONKA: ReceiptSync may only schedule through skeleton finalized F.
+		// Tip can keep moving; bridge posting is gated on F (CASE A/B). If F
+		// unexpectedly becomes unavailable, fail closed and let the next sync
+		// wait for a finalized watermark instead of falling back to head.
+		target, err := beaconHeaderTarget(d.getMode(), head, final)
 		if err != nil {
 			return err
 		}
@@ -373,7 +382,7 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			headers = make([]*types.Header, 0, maxHeadersProcess)
 			hashes  = make([]common.Hash, 0, maxHeadersProcess)
 		)
-		for i := 0; i < maxHeadersProcess && from <= head.Number.Uint64(); i++ {
+		for i := 0; i < maxHeadersProcess && from <= target; i++ {
 			header := d.skeleton.Header(from)
 
 			// The header is not found in skeleton space, try to find it in local chain.
@@ -404,7 +413,7 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			}
 		}
 		// If we still have headers to import, loop and keep pushing them
-		if from <= head.Number.Uint64() {
+		if from <= target {
 			continue
 		}
 		// If the pivot block is committed, signal header sync termination
@@ -417,7 +426,8 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			}
 		}
 		if d.getMode() == ethconfig.ReceiptSync {
-			log.Info("GONKA: ReceiptSync imported all available headers, waiting for new headers to arrive", "head", head.Number, "from", from)
+			log.Info("GONKA: ReceiptSync imported all available finalized headers, waiting",
+				"head", head.Number, "finalized", target, "from", from)
 		}
 		// State sync still going, wait a bit for new headers and retry
 		log.Trace("Pivot not yet committed, waiting...")
@@ -428,4 +438,19 @@ func (d *Downloader) fetchHeaders(from uint64) error {
 			return errCanceled
 		}
 	}
+}
+
+// beaconHeaderTarget returns the highest header the current sync mode may
+// schedule. ReceiptSync is fail-closed: it never falls back to head without F.
+func beaconHeaderTarget(mode SyncMode, head, final *types.Header) (uint64, error) {
+	if head == nil {
+		return 0, errors.New("missing skeleton head")
+	}
+	if mode != ethconfig.ReceiptSync {
+		return head.Number.Uint64(), nil
+	}
+	if final == nil {
+		return 0, errors.New("receipt sync lost skeleton finalized watermark")
+	}
+	return final.Number.Uint64(), nil
 }

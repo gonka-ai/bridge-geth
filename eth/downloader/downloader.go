@@ -444,6 +444,29 @@ func (d *Downloader) syncToHead() (err error) {
 	if err != nil {
 		return err
 	}
+	// ReceiptSync must never use the skeleton tip as a fallback send/download
+	// target. If the skeleton has not published F yet, keep the backfiller idle
+	// while Engine API head/finality updates continue in the skeleton syncer.
+	if mode == ethconfig.ReceiptSync && final == nil {
+		log.Info("GONKA: ReceiptSync waiting for skeleton finalized watermark", "head", latest.Number)
+		ticker := time.NewTicker(fsHeaderContCheck)
+		for final == nil {
+			select {
+			case <-ticker.C:
+				latest, _, final, err = d.skeleton.Bounds()
+				if err != nil {
+					ticker.Stop()
+					return err
+				}
+			case <-d.cancelCh:
+				ticker.Stop()
+				return errCanceled
+			}
+		}
+		ticker.Stop()
+		log.Info("GONKA: ReceiptSync skeleton finalized watermark available",
+			"finalized", final.Number, "head", latest.Number)
+	}
 	if latest.Number.Uint64() > uint64(fsMinFullBlocks) {
 		number := latest.Number.Uint64() - uint64(fsMinFullBlocks)
 
@@ -489,13 +512,22 @@ func (d *Downloader) syncToHead() (err error) {
 	d.syncStatsChainHeight = height
 	d.syncStatsLock.Unlock()
 
-	// GONKA: If we are in ReceiptSync mode, we need to fetch headers only from the beggining of the last epoch
+	// GONKA: ReceiptSync origin is driven by API C, but the download/send
+	// ceiling is skeleton finalized F (not tip). CASE B: F > C → origin=C.
+	// CASE A: C >= F → origin=F and fetch target=F → idle until F moves.
 	if mode == ethconfig.ReceiptSync {
-		origin, err = d.receiptSyncOrigin(latest)
+		origin, err = d.receiptSyncOrigin(latest, final)
 		if err != nil {
 			return err
 		}
-		log.Info("GONKA: ReceiptSync mode", "origin", origin)
+		if final != nil {
+			height = final.Number.Uint64()
+		}
+		log.Info("GONKA: ReceiptSync mode", "origin", origin, "finalized", height, "head", latest.Number.Uint64())
+		d.syncStatsLock.Lock()
+		d.syncStatsChainOrigin = origin
+		d.syncStatsChainHeight = height
+		d.syncStatsLock.Unlock()
 	}
 
 	// Ensure our origin point is below any snap sync pivot point
@@ -616,40 +648,40 @@ func (d *Downloader) syncToHead() (err error) {
 
 // receiptSyncOrigin computes the ReceiptSync starting origin.
 //
-// By default it is latest-1 (process the newest finalized block, preserving the
-// original behavior). When the optional bridge "last confirmed block" endpoint is
-// configured, it instead drives from the cosmos chain's last confirmed block C so
-// that any blocks the chain missed (e.g. while it was down) are re-fetched and
-// re-sent. The chain response is the single source of truth: each (re)start
-// derives origin from C, which is what makes a clean restart recover a gap.
+// Send/download ceiling is skeleton finalized F (not tip). Origin is the block
+// before the first fetched header (fetch starts at origin+1).
 //
-// `latest` here is the beacon/skeleton head (from d.skeleton.Bounds()), NOT the
-// API's block/latest (C); they move independently, which is why we keep the explicit
-// C query for re-seeding.
+//   - No continuity / cosmos down / no C yet: origin = F-1 (process newest finalized).
+//   - C returned: origin = clamp(C, skeletonTail-1, F).
+//     CASE B (F > C): origin = C → re-drive C+1…F.
+//     CASE A (C >= F): origin = F → fetch from F+1 with target F → idle until F moves.
 //
-// Tri-state behavior, matching bridge.GetLastConfirmedBlock:
-//   - endpoint absent / nothing confirmed yet: behave as before (origin = latest-1).
-//   - chain unreachable / down: FALLBACK to origin = latest-1 (Option B, §1.6) so the
-//     downloader never freezes and the Layer-2 in-RAM cache stays reachable.
-//   - C returned: origin = clamp(C, skeletonTail-1, latest-1). A deep gap below the
-//     skeleton tail forces a graceful restart so the skeleton can be re-seeded.
-func (d *Downloader) receiptSyncOrigin(latest *types.Header) (uint64, error) {
+// A deep gap below the skeleton tail still forces a graceful restart.
+func (d *Downloader) receiptSyncOrigin(latest *types.Header, final *types.Header) (uint64, error) {
 	defaultOrigin := latest.Number.Uint64() - 1
+	maxOrigin := defaultOrigin
+	if final != nil {
+		fin := final.Number.Uint64()
+		if fin > 0 {
+			defaultOrigin = fin - 1 // process through F when no C
+		} else {
+			defaultOrigin = 0
+		}
+		// Allow origin == F so CASE A idles (from=F+1 > target=F).
+		maxOrigin = fin
+	}
+
 	if !bridge.IsContinuityConfigured() {
 		return defaultOrigin, nil
 	}
 
 	confirmed, ok, err := bridge.GetLastConfirmedBlock(context.Background())
 	if err != nil {
-		// Option B (§1.6): cosmos unreachable is a FALLBACK, not a pause. Proceed from
-		// latest-1 instead of freezing the cycle, so the in-RAM Layer-2 cache stays
-		// reachable and the downloader never freezes (§1.5). Next cycle re-seeds from C
-		// once cosmos is back.
-		log.Warn("Bridge continuity: cosmos chain unreachable, proceeding from latest-1 (fallback)", "err", err)
+		// Option B (§1.6): cosmos unreachable is a FALLBACK, not a pause.
+		log.Warn("Bridge continuity: cosmos chain unreachable, proceeding from finalized-1 (fallback)", "err", err)
 		return defaultOrigin, nil
 	}
 	if !ok {
-		// Feature absent (chain not upgraded) or nothing confirmed yet: as before.
 		return defaultOrigin, nil
 	}
 
@@ -659,14 +691,36 @@ func (d *Downloader) receiptSyncOrigin(latest *types.Header) (uint64, error) {
 	}
 	tail := oldest.Number.Uint64()
 
-	// Deep gap: the skeleton no longer holds headers for [confirmed+1, tail), so we
-	// cannot re-drive that range in-process. Force a graceful exit; the supervisor
-	// (bridge script.sh) restarts geth and the fresh skeleton re-derives origin.
+	// Deep gap: the skeleton no longer holds headers for [confirmed+1, tail).
 	if confirmed+1 < tail {
 		log.Crit("Bridge continuity: last confirmed block is below skeleton tail; restarting geth to re-seed",
 			"lastConfirmed", confirmed, "skeletonTail", tail, "skeletonHead", latest.Number.Uint64())
 	}
 
+	origin := clampReceiptSyncOrigin(confirmed, tail, maxOrigin)
+
+	to := maxOrigin
+	if final != nil {
+		to = final.Number.Uint64()
+	}
+	if confirmed >= to {
+		// CASE A: API cursor is at/ahead of skeleton finality — wait for F.
+		log.Info("GONKA: CASE A idle — API latest at/above skeleton finalized; waiting for F",
+			"lastConfirmed", confirmed, "finalized", to, "head", latest.Number.Uint64(), "origin", origin)
+	} else if origin <= confirmed && confirmed < to {
+		// CASE B: F > C — re-drive from C+1 through F (cursor rewind, F unchanged).
+		log.Info("GONKA: CASE B re-drive — skeleton finalized ahead of API latest; syncing (C,F]",
+			"lastConfirmed", confirmed, "from", origin+1, "to", to, "head", latest.Number.Uint64())
+	} else if origin < defaultOrigin {
+		log.Warn("GONKA: ReceiptSync origin clamped for finalized window",
+			"lastConfirmed", confirmed, "from", origin+1, "to", to)
+	}
+	return origin, nil
+}
+
+// clampReceiptSyncOrigin bounds the API cursor C to the retained skeleton
+// window and the finalized download ceiling F.
+func clampReceiptSyncOrigin(confirmed, tail, maxOrigin uint64) uint64 {
 	minOrigin := uint64(0)
 	if tail > 0 {
 		minOrigin = tail - 1
@@ -675,14 +729,10 @@ func (d *Downloader) receiptSyncOrigin(latest *types.Header) (uint64, error) {
 	if origin < minOrigin {
 		origin = minOrigin
 	}
-	if origin > defaultOrigin {
-		origin = defaultOrigin
+	if origin > maxOrigin {
+		origin = maxOrigin
 	}
-	if origin < defaultOrigin {
-		log.Warn("Bridge continuity: gap detected, re-driving ReceiptSync from last confirmed block",
-			"lastConfirmed", confirmed, "from", origin+1, "to", latest.Number.Uint64())
-	}
-	return origin, nil
+	return origin
 }
 
 // spawnSync runs d.process and all given fetcher functions to completion in
@@ -1004,7 +1054,9 @@ func (d *Downloader) importBlockReceiptResults(results []*fetchResult) error {
 	var payloads []bridge.BlockRequest
 	startBlock := results[0].Header.Number.Uint64()
 
-	// 2. Build the payload batch sequentially (ascending order).
+	// 2. Build the payload batch sequentially (ascending order). The scheduler
+	// should only deliver blocks through F; retain this hard guard as a fail-closed
+	// invariant in case an above-final result reaches the importer unexpectedly.
 	for _, result := range results {
 		if err := d.ensureBridgeReceiptResultFinalized(result); err != nil {
 			log.Error("Refusing to process non-finalized block for bridge", "err", err)
@@ -1064,7 +1116,8 @@ func (d *Downloader) ensureBridgeReceiptResultFinalized(result *fetchResult) err
 	}
 	number := result.Header.Number.Uint64()
 	if number > final.Number.Uint64() {
-		return fmt.Errorf("block %d [%s] is above finalized skeleton block %d [%s]", number, result.Header.Hash(), final.Number.Uint64(), final.Hash())
+		return fmt.Errorf("block %d [%s] is above finalized skeleton block %d [%s]",
+			number, result.Header.Hash(), final.Number.Uint64(), final.Hash())
 	}
 	canonical := d.skeleton.Header(number)
 	if canonical == nil {

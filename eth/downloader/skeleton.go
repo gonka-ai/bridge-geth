@@ -653,7 +653,17 @@ func (s *skeleton) initSync(head *types.Header) {
 }
 
 // saveSyncStatus marshals the remaining sync tasks into leveldb.
+// GONKA: Finalized is monotonic — never persist a lower watermark than disk.
 func (s *skeleton) saveSyncStatus(db ethdb.KeyValueWriter) {
+	if status := rawdb.ReadSkeletonSyncStatus(s.db); len(status) > 0 {
+		prev := new(skeletonProgress)
+		if err := json.Unmarshal(status, prev); err == nil && prev.Finalized != nil {
+			if s.progress.Finalized == nil || *s.progress.Finalized < *prev.Finalized {
+				f := *prev.Finalized
+				s.progress.Finalized = &f
+			}
+		}
+	}
 	status, err := json.Marshal(s.progress)
 	if err != nil {
 		panic(err) // This can only fail during implementation
@@ -671,18 +681,32 @@ func (s *skeleton) processNewHead(head *types.Header, final *types.Header) error
 	log.Info("Stored new header", "number", head.Number, "hash", head.Hash())
 
 	// If a new finalized block was announced, update the sync process independent
-	// of what happens with the sync head below, and process pending headers
+	// of what happens with the sync head below, and process pending headers.
+	// GONKA: Finalized only advances (never regresses). Apply canonical chain
+	// before publishing F; on link gaps, keep pending headers and retry later
+	// without tearing the sync cycle (CASE A: let F catch up when linked).
 	if final != nil {
 		number := final.Number.Uint64()
-		if s.progress.Finalized == nil || *s.progress.Finalized != number {
-			s.progress.Finalized = new(uint64)
-			*s.progress.Finalized = final.Number.Uint64()
-
-			// Process all pending headers to create canonical chain from the finalized header
+		if s.progress.Finalized != nil && number < *s.progress.Finalized {
+			log.Warn("GONKA: ignoring regressive finalized marker",
+				"current", *s.progress.Finalized, "ignored", number)
+			return nil
+		}
+		if s.progress.Finalized == nil || number > *s.progress.Finalized {
 			if err := s.processCanonicalChain(final); err != nil {
 				log.Error("Failed to process canonical chain", "err", err)
-				return err
+				log.Warn("GONKA: finalized not advanced; will retry when skeleton links",
+					"finalized", number)
+				return nil
 			}
+			f := number
+			s.progress.Finalized = &f
+			batch := s.db.NewBatch()
+			s.saveSyncStatus(batch)
+			if err := batch.Write(); err != nil {
+				log.Crit("Failed to persist skeleton finalized", "err", err)
+			}
+			log.Info("GONKA: skeleton finalized advanced", "finalized", number)
 		}
 		s.lastFinalHead = final
 	} else if head != nil {
@@ -731,14 +755,12 @@ func (s *skeleton) processCanonicalChain(final *types.Header) error {
 	// Check for discontinuity
 	if lastchain.Head+1 < firstNewNumber {
 		log.Warn("Gap detected in canonical chain", "head", lastchain.Head, "next", firstNewNumber)
-		// Don't return error, just skip this header
 		return fmt.Errorf("GONKA: gap detected in canonical chain")
 	}
 
 	// For non-genesis blocks, verify parent linkage
 	if parent := rawdb.ReadSkeletonHeader(s.db, firstNewNumber-1); parent == nil || parent.Hash() != firstNewHeader.ParentHash {
 		log.Warn("Non-sequential header in canonical chain", "number", firstNewNumber, "hash", firstNewHeader.Hash())
-		// Don't return error, just skip this header
 		return fmt.Errorf("GONKA: non-sequential header in canonical chain")
 	}
 
@@ -752,7 +774,8 @@ func (s *skeleton) processCanonicalChain(final *types.Header) error {
 		log.Debug("Adding header to canonical chain", "number", number, "hash", header.Hash())
 	}
 
-	// Save the updated sync status
+	// Persist subchain head progress. Finalized watermark is set by the caller
+	// only after this succeeds (monotonic F).
 	s.saveSyncStatus(batch)
 
 	if err := batch.Write(); err != nil {
@@ -1352,9 +1375,12 @@ func (s *skeleton) Bounds() (head *types.Header, tail *types.Header, final *type
 	if tail == nil {
 		return nil, nil, nil, fmt.Errorf("tail skeleton header %d is missing", progress.Subchains[0].Tail)
 	}
-	if progress.Finalized != nil && tail.Number.Uint64() <= *progress.Finalized && *progress.Finalized <= head.Number.Uint64() {
+	// GONKA: Expose Finalized even when it sits below Subchains[0].Tail (e.g. a
+	// tip-only subchain was prepended). Bridge ReceiptSync uses F as the send
+	// ceiling and must not see final=nil just because the active subchain moved.
+	if progress.Finalized != nil {
 		final = rawdb.ReadSkeletonHeader(s.db, *progress.Finalized)
-		if final == nil {
+		if final == nil && tail.Number.Uint64() <= *progress.Finalized && *progress.Finalized <= head.Number.Uint64() {
 			return nil, nil, nil, fmt.Errorf("finalized skeleton header %d is missing", *progress.Finalized)
 		}
 	}
@@ -1373,6 +1399,9 @@ func (s *skeleton) Bounds() (head *types.Header, tail *types.Header, final *type
 		}(),
 		"finalized", func() interface{} {
 			if final == nil {
+				if progress.Finalized != nil {
+					return *progress.Finalized // watermark known, header temporarily unavailable
+				}
 				return "nil"
 			}
 			return final.Number.Uint64()
