@@ -27,24 +27,33 @@ import (
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 )
 
-func TestClampReceiptSyncOrigin(t *testing.T) {
+func TestReceiptSyncOriginFromCursor(t *testing.T) {
 	tests := []struct {
 		name       string
 		confirmed  uint64
 		tail       uint64
-		maxOrigin  uint64
 		wantOrigin uint64
+		wantErr    bool
 	}{
-		{name: "case B uses API cursor", confirmed: 90, tail: 80, maxOrigin: 100, wantOrigin: 90},
-		{name: "case A equal finality idles at F", confirmed: 100, tail: 80, maxOrigin: 100, wantOrigin: 100},
-		{name: "case A ahead of finality clamps to F", confirmed: 110, tail: 80, maxOrigin: 100, wantOrigin: 100},
-		{name: "retained boundary permits tail minus one", confirmed: 79, tail: 80, maxOrigin: 100, wantOrigin: 79},
-		{name: "cursor below retained range clamps to tail minus one", confirmed: 70, tail: 80, maxOrigin: 100, wantOrigin: 79},
-		{name: "genesis tail does not underflow", confirmed: 0, tail: 0, maxOrigin: 0, wantOrigin: 0},
+		{name: "case B next block is C+1", confirmed: 90, tail: 80, wantOrigin: 90},
+		{name: "case A cursor above finality keeps C+1", confirmed: 110, tail: 80, wantOrigin: 110},
+		{name: "retained boundary permits tail minus one", confirmed: 79, tail: 80, wantOrigin: 79},
+		{name: "cursor below retained range fails for retry", confirmed: 70, tail: 80, wantErr: true},
+		{name: "genesis tail does not underflow", confirmed: 0, tail: 0, wantOrigin: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := clampReceiptSyncOrigin(tt.confirmed, tt.tail, tt.maxOrigin); got != tt.wantOrigin {
+			got, err := receiptSyncOriginFromCursor(tt.confirmed, tt.tail)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("deep cursor gap did not fail closed: have origin %d", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.wantOrigin {
 				t.Fatalf("origin mismatch: have %d, want %d", got, tt.wantOrigin)
 			}
 		})
