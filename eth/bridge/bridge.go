@@ -68,6 +68,11 @@ func isBurnAddress(addr common.Address) bool {
 	return addr == zeroAddress || addr == deadAddress
 }
 
+// maxBridgeAmountDigits mirrors MaxBridgeAmountDigits in the Gonka chain's
+// MsgBridgeExchange.ValidateBasic: a decimal amount longer than this can never
+// be accepted, so delivering it would only make the API retry the block.
+const maxBridgeAmountDigits = 78
+
 // classifyBridgeLog determines if a log is a deposit (lock) or burn (withdraw) related to the bridge
 func classifyBridgeLog(
 	logEntry *types.Log,
@@ -497,11 +502,30 @@ func PrepareBlockPayload(header *types.Header, receipts types.Receipts, transact
 					continue
 				}
 
+				amountStr := amount.String()
+				if len(amountStr) > maxBridgeAmountDigits {
+					// Any contract can emit a Transfer-topic log, and log data longer than
+					// 32 bytes decodes past the chain's limit. Drop the whole receipt
+					// (break, not continue): earlier feeders delivered this log and
+					// stopped, so picking a later log here would make feeder versions
+					// vote on different content for the same receipt.
+					log.Warn("Bridge: Skipping receipt with amount the chain cannot accept",
+						"token_contract", logEntry.Address.Hex(),
+						"from", from.Hex(),
+						"dataLen", len(logEntry.Data),
+						"amountDigits", len(amountStr),
+						"block", blockNum,
+						"index", i,
+						"isDeposit", isDeposit,
+						"isBurn", isBurn)
+					break
+				}
+
 				filteredReceipts = append(filteredReceipts, ReceiptData{
 					Contract:     logEntry.Address.Hex(),
 					Owner:        from.Hex(),
 					PublicKey:    pubKey,
-					Amount:       amount.String(),
+					Amount:       amountStr,
 					ReceiptIndex: fmt.Sprintf("%d", i),
 				})
 
