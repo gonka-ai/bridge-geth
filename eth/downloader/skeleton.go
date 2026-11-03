@@ -708,6 +708,12 @@ func (s *skeleton) processNewHead(head *types.Header, final *types.Header) error
 				log.Info("GONKA: finalized marker advanced over stored skeleton headers",
 					"finalized", number, "head", s.progress.Subchains[0].Head)
 			} else if err := s.processCanonicalChain(final); err != nil {
+				if errors.Is(err, errChainGapped) {
+					// Headers between our head and the client's chain will never be
+					// announced (fresh checkpoint): restart the cycle to backfill them.
+					log.Warn("GONKA: finalized chain gapped from skeleton head; resyncing", "head", s.progress.Subchains[0].Head, "finalized", number)
+					return err
+				}
 				log.Error("Failed to process canonical chain", "err", err)
 				log.Warn("GONKA: finalized not advanced; will retry when skeleton links",
 					"finalized", number)
@@ -769,7 +775,7 @@ func (s *skeleton) processCanonicalChain(final *types.Header) error {
 	// Check for discontinuity
 	if lastchain.Head+1 < firstNewNumber {
 		log.Warn("Gap detected in canonical chain", "head", lastchain.Head, "next", firstNewNumber)
-		return fmt.Errorf("GONKA: gap detected in canonical chain")
+		return fmt.Errorf("GONKA: canonical chain: %w", errChainGapped)
 	}
 
 	// For non-genesis blocks, verify parent linkage
